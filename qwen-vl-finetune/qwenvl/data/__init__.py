@@ -26,12 +26,18 @@ VIDEOCHATGPT = {
     "data_path": "PATH_TO_VIDEOCHATGPT_DATA",
 }
 
+R2R_ALIGNMENT_QA = {
+    "annotation_path": "/home/rithvik/IROS_proj/cvpr_proj/llm_test/r2r_alignment_dataset_qa.json",
+    "data_path": "/home/rithvik/IROS_proj/cvpr_proj/llm_test",
+}
+
 data_dict = {
     "cambrian_737k": CAMBRIAN_737K,
     "cambrian_737k_pack": CAMBRIAN_737K_PACK,
     "mp_doc": MP_DOC,
     "clevr_mc": CLEVR_MC,
     "videochatgpt": VIDEOCHATGPT,
+    "r2r_alignment_qa": R2R_ALIGNMENT_QA,
 }
 
 
