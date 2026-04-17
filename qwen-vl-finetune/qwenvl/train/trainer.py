@@ -202,7 +202,7 @@ def qwen3vl_forward(
 
 def return_mask(
     config,
-    input_embeds,
+    inputs_embeds,
     attention_mask,
     cache_position,
     past_key_values,

@@ -137,64 +137,52 @@ def update_processor_pixels(processor, data_args):
     return processor
 
 
+NUM_HISTORICAL_FRAMES = 7
+
+
+def _sample_frame_indices(total_frames: int, num_frames: int) -> List[int]:
+    """Uniformly sample num_frames indices from total_frames.
+    If total_frames < num_frames, repeats frame 0 at the front (same as _vlnce_sample_indices).
+    If total_frames > num_frames, uniformly downsamples via linspace.
+    """
+    if total_frames <= 0:
+        return [0] * num_frames
+    padded = max(0, num_frames - total_frames)
+    effective_len = total_frames + padded
+    sampled = np.linspace(0, effective_len - 1, num=num_frames - 1, endpoint=False, dtype=int).tolist()
+    sampled.append(effective_len - 1)
+    return [max(0, idx - padded) for idx in sampled]
+
+
 def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any]]:
-    # Extract and normalize images and videos
-    images = item.get("image") or []
-    if isinstance(images, str):
-        images = [images]
+    system_prompt = "You are a helpful navigation assistant."
+    messages = [{"role": "system", "content": [{"type": "text", "text": system_prompt}]}]
 
-    videos = item.get("video") or []
-    if isinstance(videos, str):
-        videos = [videos]
+    frames = item["frames"]
+    if len(frames) < 1:
+        raise ValueError(f"item has no frames: {item.get('video_id', '')}")
+    current = frames[-1]            # last frame is current observation
+    historical_pool = frames[:-1] if len(frames) > 1 else [frames[0]]
 
-    # Build media pools with absolute paths
-    image_pool = [
-        {"type": "image", "image": _make_abs_paths(base_path, img)} for img in images
+    # Always produce exactly NUM_HISTORICAL_FRAMES historical frames.
+    # Too many → uniform downsample; too few → repeat frame 0 (same as _vlnce_sample_indices).
+    indices = _sample_frame_indices(len(historical_pool), NUM_HISTORICAL_FRAMES)
+    historical = [historical_pool[i] for i in indices]
+
+    content = [
+        {"type": "text", "text": "Imagine you are a robot programmed for navigation tasks. You have been given a video of historical observations:"},
+        *[{"type": "image", "image": _make_abs_paths(base_path, f)} for f in historical],
+        {"type": "text", "text": "and current observation:"},
+        {"type": "image", "image": _make_abs_paths(base_path, current)},
+        {"type": "text", "text": (
+            f"Your assigned task is: {item['q']}\n"
+            "Analyze this series of images to decide your next move, which could involve "
+            "turning left or right by a specific degree, moving forward a certain distance, "
+            "or stop if the task is completed."
+        )},
     ]
-    video_pool = [
-        {"type": "video", "video": _make_abs_paths(base_path, vid)} for vid in videos
-    ]
-
-    messages = []
-    for turn in item["conversations"]:
-        role = "user" if turn["from"] == "human" else "assistant"
-        text: str = turn["value"]
-
-        if role == "user":
-            content = []
-            # Split text by <image> or <video> placeholders while keeping delimiters
-            text_parts = re.split(r"(<image>|<video>)", text)
-
-            for seg in text_parts:
-                if seg == "<image>":
-                    if not image_pool:
-                        raise ValueError(
-                            "Number of <image> placeholders exceeds the number of provided images"
-                        )
-                    content.append(image_pool.pop(0))
-                elif seg == "<video>":
-                    if not video_pool:
-                        raise ValueError(
-                            "Number of <video> placeholders exceeds the number of provided videos"
-                        )
-                    content.append(video_pool.pop(0))
-                elif seg.strip():
-                    content.append({"type": "text", "text": seg.strip()})
-
-            messages.append({"role": role, "content": content})
-        else:
-            # Assistant messages contain only text
-            messages.append({"role": role, "content": [{"type": "text", "text": text}]})
-
-    # Check for unused media files
-    if image_pool:
-        raise ValueError(
-            f"{len(image_pool)} image(s) remain unused (not consumed by placeholders)"
-        )
-    if video_pool:
-        raise ValueError(
-            f"{len(video_pool)} video(s) remain unused (not consumed by placeholders)"
-        )
+    messages.append({"role": "user", "content": content})
+    messages.append({"role": "assistant", "content": [{"type": "text", "text": item["a"]}]})
 
     return messages
 

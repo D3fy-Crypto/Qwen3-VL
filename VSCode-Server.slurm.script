@@ -1,0 +1,94 @@
+#!/bin/bash
+
+# ---------------------------------------------------
+# The Advanced Research Computing at Hopkins (ARCH)
+# User and Application Support < help@rockfish.jhu.edu >
+#
+# SLURM script to run the VSCode-Server
+#
+# ---------------------------------------------------
+#  INPUT ENVIRONMENT VARIABLES
+# ---------------------------------------------------
+#SBATCH --job-name=vscode_djonna1
+#SBATCH --time=00-04:00
+#SBATCH --partition=cpu
+#SBATCH --signal=USR2
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=2
+#SBATCH --account=tinoosh
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=djonna1@jhu.edu
+#SBATCH --output=vscode-server.job.%j.out
+# ---------------------------------------------------
+
+
+source /apps/Lmod
+module restore
+module load vscodeserver/4.96.4
+module load gcc/9.3.0 git 
+
+CODE_SERVER_DATAROOT=${HOME}/vscodeserver/4.96.4
+
+if [[ ! -d  $CODE_SERVER_DATAROOT/extensions ]]; then
+    mkdir -p $CODE_SERVER_DATAROOT/extensions
+    rsync -rpa  $EXTENSIONS/extensions/ $CODE_SERVER_DATAROOT/extensions
+fi
+
+# Print compute node.
+echo "$(date): Running on compute node ${host}:$port"
+
+CPP_FILE=${CODE_SERVER_DATAROOT}/c_cpp_properties.json
+
+if [[ -f "$CPP_FILE" ]]; then
+    CPP_DIR="${TMPDIR:=/tmp/$USER}/cpp-vscode"
+    mkdir -p "$CPP_DIR"
+    chmod 700 "$CPP_DIR"
+
+    # if the file is empty, let's initialize it
+    [ -s "$CPP_FILE" ] || echo '{"configurations": [{ "name": "Linux", "browse": { "databaseFilename": null }}], "version": 4}' > "$CPP_FILE"
+
+    jq --arg dbfile "$CPP_DIR/cpp-vscode.db" \
+      '.configurations[0].browse.databaseFilename = $dbfile' \
+      "$CPP_FILE" > "$CPP_FILE".new
+
+    mv "$CPP_FILE".new "$CPP_FILE"
+fi
+
+#
+# Start Code Server.
+#
+echo "$(date): Started code-server"
+echo ""
+
+readonly export PORT=$(python -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()')
+
+# Expose the password to the code-server.
+export PASSWORD=$(crypde.sh -d ${HOME}/vscodeserver/.cretendials)
+
+cat 1>&2 <<END
+
+1. SSH tunnel from your workstation using the following command:
+
+   ssh -N -L ${PORT}:${HOSTNAME}:${PORT} ${USER}@dsailogin.arch.jhu.edu
+
+2. log in to VSCode Server in your web browser using the DSAI cluster credentials (username and password) at:
+
+   http://localhost:${PORT}
+   password: < DSAI password >
+
+3. When done using VSCode Server, terminate the job by:
+
+   a. Exit the VSCode Session ("power" button in the top right corner of the VSCode window)
+   b. Issue the following command on the login node:
+
+  scancel -f ${SLURM_JOB_ID}
+END
+
+code-server \
+    --auth=password \
+    --bind-addr="0.0.0.0:${PORT}" \
+    --disable-telemetry \
+    --extensions-dir=${CODE_SERVER_DATAROOT}/extensions \
+    --user-data-dir=${CODE_SERVER_DATAROOT} \
+    ${CODE_SERVER_DATAROOT}
+

@@ -29,16 +29,26 @@ if [[ "${SMOKE:-0}" == "1" ]]; then
     BATCH_SIZE=1
     GRAD_ACCUM=1
     NPROC_OVERRIDE=1
+    MODEL_MAX_LENGTH=512
     MAX_STEPS_ARG="--max_steps 10"
     SAVE_STRATEGY_ARG="--save_strategy no"
     REPORT_ARG="--report_to none"
+    TUNE_LLM_ARG="--tune_mm_llm False"
+    PIXELS_ARG="--max_pixels 4096 --min_pixels 784"
+    WORKERS_ARG="--dataloader_num_workers 2"
+    DEEPSPEED_ARG=""
     RUN_NAME="smoke-$(date +%Y%m%d-%H%M)"
-    OUTPUT_DIR="/scratch/tinoosh/chang/checkpoints/${RUN_NAME}"
+    OUTPUT_DIR="/scratchtinoosh/chang/checkpoints/${RUN_NAME}"
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 else
     NPROC_OVERRIDE=8
     MAX_STEPS_ARG=""
     SAVE_STRATEGY_ARG="--save_strategy steps --save_steps 500 --save_total_limit 2"
     REPORT_ARG="--report_to wandb"
+    TUNE_LLM_ARG="--tune_mm_llm True"
+    PIXELS_ARG="--max_pixels 50176 --min_pixels 784"
+    WORKERS_ARG="--dataloader_num_workers 16"
+    DEEPSPEED_ARG="--deepspeed ./scripts/zero3.json"
 fi
 # ============================================================
 
@@ -79,22 +89,21 @@ torchrun \
     --master_addr=${MASTER_ADDR} \
     --master_port=${MASTER_PORT} \
     qwenvl/train/train_qwen.py \
-        --deepspeed ./scripts/zero3.json \
+        ${DEEPSPEED_ARG} \
         --model_name_or_path "${MODEL_PATH}" \
         --model_type qwen3vl \
         --dataset_use "${DATASETS}" \
         --data_flatten True \
         --tune_mm_vision True \
         --tune_mm_mlp True \
-        --tune_mm_llm True \
+        ${TUNE_LLM_ARG} \
         --bf16 \
         --output_dir "${OUTPUT_DIR}" \
         --num_train_epochs ${EPOCHS} \
         --per_device_train_batch_size ${BATCH_SIZE} \
         --per_device_eval_batch_size $((BATCH_SIZE * 2)) \
         --gradient_accumulation_steps ${GRAD_ACCUM} \
-        --max_pixels 50176 \
-        --min_pixels 784 \
+        ${PIXELS_ARG} \
         --eval_strategy no \
         ${SAVE_STRATEGY_ARG} \
         --learning_rate ${LR} \
@@ -105,7 +114,7 @@ torchrun \
         --logging_steps 10 \
         --model_max_length ${MODEL_MAX_LENGTH} \
         --gradient_checkpointing True \
-        --dataloader_num_workers 16 \
+        ${WORKERS_ARG} \
         --run_name "${RUN_NAME}" \
         ${MAX_STEPS_ARG} \
         ${REPORT_ARG}

@@ -1,43 +1,38 @@
 import re
 
-# Define placeholders for dataset paths
-CAMBRIAN_737K = {
-    "annotation_path": "PATH_TO_CAMBRIAN_737K_ANNOTATION",
-    "data_path": "",
+NAVILA_BASE = "/weka/scratch/tinoosh/iros_dataset/NaVILA-Dataset"
+
+R2R = {
+    "annotation_path": f"{NAVILA_BASE}/R2R/annotations.json",
+    "data_path": f"{NAVILA_BASE}/R2R/train",
 }
 
-CAMBRIAN_737K_PACK = {
-    "annotation_path": f"PATH_TO_CAMBRIAN_737K_ANNOTATION_PACKED",
-    "data_path": f"",
+ENVDROP = {
+    "annotation_path": f"{NAVILA_BASE}/EnvDrop/annotations.json",
+    "data_path": f"{NAVILA_BASE}/R2R/train",
 }
 
-MP_DOC = {
-    "annotation_path": "PATH_TO_MP_DOC_ANNOTATION",
-    "data_path": "PATH_TO_MP_DOC_DATA",
+HUMAN = {
+    "annotation_path": f"{NAVILA_BASE}/Human/annotations.json",
+    "data_path": f"{NAVILA_BASE}/R2R/train",
 }
 
-CLEVR_MC = {
-    "annotation_path": "PATH_TO_CLEVR_MC_ANNOTATION",
-    "data_path": "PATH_TO_CLEVR_MC_DATA",
+RXR = {
+    "annotation_path": f"{NAVILA_BASE}/RxR/annotations.json",
+    "data_path": f"{NAVILA_BASE}/RxR/train",
 }
 
-VIDEOCHATGPT = {
-    "annotation_path": "PATH_TO_VIDEOCHATGPT_ANNOTATION",
-    "data_path": "PATH_TO_VIDEOCHATGPT_DATA",
-}
-
-R2R_ALIGNMENT_QA = {
-    "annotation_path": "/weka/scratch/tinoosh/iros_dataset/NaVILA-Dataset/R2R/no_gru_R2R.json",
-    "data_path": "/weka/scratch/tinoosh/iros_dataset/NaVILA-Dataset/R2R/train",
+SCANQA = {
+    "annotation_path": f"{NAVILA_BASE}/ScanQA/annotations/ScanQA_v1.0_train_reformat.json",
+    "data_path": f"{NAVILA_BASE}/ScanQA/videos",
 }
 
 data_dict = {
-    "cambrian_737k": CAMBRIAN_737K,
-    "cambrian_737k_pack": CAMBRIAN_737K_PACK,
-    "mp_doc": MP_DOC,
-    "clevr_mc": CLEVR_MC,
-    "videochatgpt": VIDEOCHATGPT,
-    "r2r_alignment_qa": R2R_ALIGNMENT_QA,
+    "r2r": R2R,
+    "envdrop": ENVDROP,
+    "human": HUMAN,
+    "rxr": RXR,
+    "scanqa": SCANQA,
 }
 
 
@@ -63,7 +58,7 @@ def data_list(dataset_names):
 
 
 if __name__ == "__main__":
-    dataset_names = ["cambrian_737k"]
+    dataset_names = ["r2r"]
     configs = data_list(dataset_names)
     for config in configs:
         print(config)
