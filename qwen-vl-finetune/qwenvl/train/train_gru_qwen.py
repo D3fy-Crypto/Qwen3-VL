@@ -155,7 +155,7 @@ def train(attn_implementation="flash_attention_2"):
         rank0_print(f"  GRU trainable params: {stats['trajectory_gru_trainable']:,}")
 
     rank0_print("[GRU-Qwen] Loading dataset...")
-    from qwenvl.data.data_processor import make_supervised_data_module
+    from qwenvl.data.data_processor_gru import make_supervised_data_module
     data_module = make_supervised_data_module(processor, data_args=data_args)
     if data_module.get("train_dataset") is None or data_module.get("data_collator") is None:
         raise RuntimeError("GRU-Qwen training requires non-empty train_dataset and data_collator")

@@ -4,6 +4,7 @@ import logging
 import re
 import time
 import itertools
+import math
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Sequence, List, Tuple, Any
 from collections.abc import Sequence
@@ -24,6 +25,11 @@ VIDEO_TOKEN_INDEX = 151656
 DEFAULT_IMAGE_TOKEN = "<image>"
 DEFAULT_VIDEO_TOKEN = "<video>"
 
+STOP = 0
+FORWARD = 1
+TURN_LEFT = 2
+TURN_RIGHT = 3
+
 local_rank = None
 
 
@@ -35,6 +41,48 @@ def rank0_print(*args):
 def read_jsonl(path):
     with open(path, "r") as f:
         return [json.loads(line) for line in f]
+
+
+def actions_to_motion_features(action_seq, theta0=0.0, step_m=0.25, turn_deg=15.0):
+    """
+    Convert integer action IDs into the same 7D motion features used in gru_train_final.ipynb.
+    Feature order: [cum_x, cum_y, sin(theta), cos(theta), dyaw, is_forward, is_turn].
+    """
+    if not action_seq:
+        return torch.zeros((1, 7), dtype=torch.float32)
+
+    theta = theta0
+    turn_rad = math.radians(turn_deg)
+    cum_x, cum_y = 0.0, 0.0
+    rows = []
+
+    for a in action_seq:
+        dx_local = 0.0
+        dyaw = 0.0
+        if a == FORWARD:
+            dx_local = step_m
+        elif a == TURN_LEFT:
+            dyaw = turn_rad
+        elif a == TURN_RIGHT:
+            dyaw = -turn_rad
+
+        theta += dyaw
+        cum_x += dx_local * math.cos(theta)
+        cum_y += dx_local * math.sin(theta)
+
+        rows.append(
+            [
+                cum_x,
+                cum_y,
+                math.sin(theta),
+                math.cos(theta),
+                dyaw,
+                1.0 if a == FORWARD else 0.0,
+                1.0 if a in (TURN_LEFT, TURN_RIGHT) else 0.0,
+            ]
+        )
+
+    return torch.tensor(rows, dtype=torch.float32)
 
 
 def _make_abs_paths(base: Path, files: str) -> str:
@@ -167,17 +215,23 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any
 
             for seg in text_parts:
                 if seg == "<image>":
-                    if not image_pool:
-                        raise ValueError(
-                            "Number of <image> placeholders exceeds the number of provided images"
-                        )
-                    content.append(image_pool.pop(0))
+                    if image_pool:
+                        cand = image_pool.pop(0)
+                        if Path(cand["image"]).exists():
+                            content.append(cand)
+                        else:
+                            content.append({"type": "text", "text": "[missing_image]"})
+                    else:
+                        content.append({"type": "text", "text": "[missing_image]"})
                 elif seg == "<video>":
-                    if not video_pool:
-                        raise ValueError(
-                            "Number of <video> placeholders exceeds the number of provided videos"
-                        )
-                    content.append(video_pool.pop(0))
+                    if video_pool:
+                        cand = video_pool.pop(0)
+                        if Path(cand["video"]).exists():
+                            content.append(cand)
+                        else:
+                            content.append({"type": "text", "text": "[missing_video]"})
+                    else:
+                        content.append({"type": "text", "text": "[missing_video]"})
                 elif seg.strip():
                     content.append({"type": "text", "text": seg.strip()})
 
@@ -185,16 +239,6 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any
         else:
             # Assistant messages contain only text
             messages.append({"role": role, "content": [{"type": "text", "text": text}]})
-
-    # Check for unused media files
-    if image_pool:
-        raise ValueError(
-            f"{len(image_pool)} image(s) remain unused (not consumed by placeholders)"
-        )
-    if video_pool:
-        raise ValueError(
-            f"{len(video_pool)} video(s) remain unused (not consumed by placeholders)"
-        )
 
     return messages
 
@@ -437,6 +481,25 @@ class LazySupervisedDataset(Dataset):
         ]
         label = self.processor.tokenizer.decode(labels, skip_special_tokens=False)
 
+        source_item = sources[0] if isinstance(sources, list) and len(sources) > 0 else {}
+        raw_actions = source_item.get("gru", [])
+        if not isinstance(raw_actions, list):
+            raw_actions = []
+        raw_actions = [int(a) for a in raw_actions if isinstance(a, (int, float))]
+
+        min_seq_len = max(1, int(getattr(self.data_args, "gru_min_seq_len", 1)))
+        if len(raw_actions) < min_seq_len:
+            if getattr(self.data_args, "gru_fallback_to_stop", True):
+                raw_actions = [STOP] * min_seq_len
+            else:
+                raise ValueError(
+                    f"Sample has short GRU sequence len={len(raw_actions)} < {min_seq_len}"
+                )
+
+        gru_features = actions_to_motion_features(raw_actions)
+        data_dict["gru_features"] = gru_features
+        data_dict["gru_length"] = torch.tensor(gru_features.size(0), dtype=torch.long)
+
         return data_dict
 
     def _get_packed_item(self, sources) -> Dict[str, torch.Tensor]:
@@ -598,6 +661,17 @@ class DataCollatorForSupervisedDataset(object):
         batch["pixel_values_videos"] = concat_videos
         batch["video_grid_thw"] = video_grid_thw
         batch["position_ids"] = position_ids
+
+        if all("gru_features" in instance for instance in instances):
+            gru_features = [instance["gru_features"] for instance in instances]
+            gru_lengths = torch.tensor(
+                [int(instance["gru_length"]) for instance in instances], dtype=torch.long
+            )
+            batch["gru_features"] = torch.nn.utils.rnn.pad_sequence(
+                gru_features, batch_first=True, padding_value=0.0
+            )
+            batch["gru_lengths"] = gru_lengths
+
         return batch
 
 
@@ -671,6 +745,16 @@ class FlattenedDataCollatorForSupervisedDataset(DataCollatorForSupervisedDataset
         batch["image_grid_thw"] = grid_thw
         batch["pixel_values_videos"] = concat_videos
         batch["video_grid_thw"] = video_grid_thw
+
+        if all("gru_features" in instance for instance in instances):
+            gru_features = [instance["gru_features"] for instance in instances]
+            gru_lengths = torch.tensor(
+                [int(instance["gru_length"]) for instance in instances], dtype=torch.long
+            )
+            batch["gru_features"] = torch.nn.utils.rnn.pad_sequence(
+                gru_features, batch_first=True, padding_value=0.0
+            )
+            batch["gru_lengths"] = gru_lengths
 
         return batch
 

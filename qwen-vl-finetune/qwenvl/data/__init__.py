@@ -27,8 +27,8 @@ VIDEOCHATGPT = {
 }
 
 R2R_ALIGNMENT_QA = {
-    "annotation_path": "/home/rithvik/IROS_proj/cvpr_proj/llm_test/r2r_alignment_dataset_qa.json",
-    "data_path": "/home/rithvik/IROS_proj/cvpr_proj/llm_test",
+    "annotation_path": "/weka/scratch/tinoosh/iros_dataset/NaVILA-Dataset/R2R/no_gru_R2R.json",
+    "data_path": "/weka/scratch/tinoosh/iros_dataset/NaVILA-Dataset/R2R/train",
 }
 
 data_dict = {
