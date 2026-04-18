@@ -9,9 +9,11 @@ from typing import Dict, Optional, Sequence, List, Tuple, Any
 from collections.abc import Sequence
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from PIL import Image as PILImage
 
 import transformers
 
@@ -37,8 +39,8 @@ def read_jsonl(path):
         return [json.loads(line) for line in f]
 
 
-def _make_abs_paths(base: Path, files: str) -> str:
-    return f"{(base / files).resolve()}"
+def _make_abs_paths(base: Path, files: str) -> PILImage.Image:
+    return PILImage.open((base / files).resolve()).convert("RGB")
 
 
 def update_processor_pixels(processor, data_args):
@@ -154,9 +156,40 @@ def _sample_frame_indices(total_frames: int, num_frames: int) -> List[int]:
     return [max(0, idx - padded) for idx in sampled]
 
 
+def _extract_video_frames(video_path: str, num_frames: int) -> List[PILImage.Image]:
+    cap = cv2.VideoCapture(video_path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    indices = _sample_frame_indices(max(total, 1), num_frames)
+    frames = []
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if ret:
+            frames.append(PILImage.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+        elif frames:
+            frames.append(frames[-1])
+        else:
+            frames.append(PILImage.new("RGB", (224, 224)))
+    cap.release()
+    return frames
+
+
 def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any]]:
     system_prompt = "You are a helpful navigation assistant."
     messages = [{"role": "system", "content": [{"type": "text", "text": system_prompt}]}]
+
+    # ScanQA format: video_id + q + a (list), no frames key
+    if "frames" not in item:
+        video_path = str((base_path / f"{item['video_id']}.mp4").resolve())
+        pil_frames = _extract_video_frames(video_path, NUM_HISTORICAL_FRAMES + 1)
+        answer = random.choice(item["a"]) if isinstance(item["a"], list) else item["a"]
+        content = [
+            *[{"type": "image", "image": f} for f in pil_frames],
+            {"type": "text", "text": item["q"]},
+        ]
+        messages.append({"role": "user", "content": content})
+        messages.append({"role": "assistant", "content": [{"type": "text", "text": answer}]})
+        return messages
 
     frames = item["frames"]
     if len(frames) < 1:

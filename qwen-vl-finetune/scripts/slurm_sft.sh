@@ -14,40 +14,40 @@
 # Configurable — edit these before submitting
 # ============================================================
 MODEL_PATH="/home/djonna1/scratchtinoosh/iros_dataset/Qwen-Model/instruct"
-DATASETS="r2r_alignment_qa"
+DATASETS="human"
 RUN_NAME="qwen3vl-sft-$(date +%Y%m%d-%H%M)"
 OUTPUT_DIR="/scratch/tinoosh/chang/checkpoints/${RUN_NAME}"
 WANDB_PROJECT="qwen3vl-sft"
 
 LR=1e-4
-BATCH_SIZE=4
-GRAD_ACCUM=4
+BATCH_SIZE=2
+GRAD_ACCUM=8
 EPOCHS=1
 MODEL_MAX_LENGTH=4096
 
 if [[ "${SMOKE:-0}" == "1" ]]; then
-    BATCH_SIZE=1
-    GRAD_ACCUM=1
-    NPROC_OVERRIDE=1
-    MODEL_MAX_LENGTH=512
+    BATCH_SIZE=10
+    GRAD_ACCUM=8
+    NPROC_OVERRIDE=2
+    MODEL_MAX_LENGTH=4096
     MAX_STEPS_ARG="--max_steps 10"
-    SAVE_STRATEGY_ARG="--save_strategy no"
+    SAVE_STRATEGY_ARG="--save_strategy steps --save_steps 500 --save_total_limit 2"
     REPORT_ARG="--report_to none"
-    TUNE_LLM_ARG="--tune_mm_llm False"
+    TUNE_LLM_ARG="--tune_mm_llm True"
     PIXELS_ARG="--max_pixels 4096 --min_pixels 784"
-    WORKERS_ARG="--dataloader_num_workers 2"
-    DEEPSPEED_ARG=""
+    WORKERS_ARG="--dataloader_num_workers 4"
+    DEEPSPEED_ARG="--deepspeed ./scripts/zero3.json"
     RUN_NAME="smoke-$(date +%Y%m%d-%H%M)"
-    OUTPUT_DIR="/scratchtinoosh/chang/checkpoints/${RUN_NAME}"
+    OUTPUT_DIR="/scratch/tinoosh/chang/checkpoints/${RUN_NAME}"
     export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 else
-    NPROC_OVERRIDE=8
+    NPROC_OVERRIDE=2
     MAX_STEPS_ARG=""
     SAVE_STRATEGY_ARG="--save_strategy steps --save_steps 500 --save_total_limit 2"
     REPORT_ARG="--report_to wandb"
     TUNE_LLM_ARG="--tune_mm_llm True"
     PIXELS_ARG="--max_pixels 50176 --min_pixels 784"
-    WORKERS_ARG="--dataloader_num_workers 16"
+    WORKERS_ARG="--dataloader_num_workers 4"
     DEEPSPEED_ARG="--deepspeed ./scripts/zero3.json"
 fi
 # ============================================================
@@ -101,7 +101,6 @@ torchrun \
         --output_dir "${OUTPUT_DIR}" \
         --num_train_epochs ${EPOCHS} \
         --per_device_train_batch_size ${BATCH_SIZE} \
-        --per_device_eval_batch_size $((BATCH_SIZE * 2)) \
         --gradient_accumulation_steps ${GRAD_ACCUM} \
         ${PIXELS_ARG} \
         --eval_strategy no \

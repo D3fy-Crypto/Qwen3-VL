@@ -1,6 +1,5 @@
 """
-Quick test: run _build_messages + preprocess_qwen_visual on the first item
-of R2R_ALIGNMENT_QA and show messages, decoded input_ids, and labels.
+Test _build_messages on the first item of every dataset.
 Usage: python qwen-vl-finetune/qwenvl/data/test_build_messages.py
 """
 
@@ -10,11 +9,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from qwenvl.data.data_processor import _build_messages, preprocess_qwen_visual
+from qwenvl.data.data_processor import _build_messages
+from qwenvl.data import data_dict as DATASETS
 
-ANNOTATION_PATH = "/weka/scratch/tinoosh/iros_dataset/NaVILA-Dataset/R2R/annotations.json"
-DATA_PATH       = "/weka/scratch/tinoosh/iros_dataset/NaVILA-Dataset/R2R/train"
-MODEL_PATH      = "/home/djonna1/scratchtinoosh/iros_dataset/Qwen-Model/instruct"
+MODEL_PATH = "/home/djonna1/scratchtinoosh/iros_dataset/Qwen-Model/instruct"
 
 
 def load_first_item(path: str) -> dict:
@@ -40,58 +38,50 @@ def load_first_item(path: str) -> dict:
         return json.loads(buf)
 
 
+def summarize_messages(messages):
+    import PIL.Image
+
+    def serialize(obj):
+        if isinstance(obj, PIL.Image.Image):
+            return f"<PIL Image mode={obj.mode} size={obj.size}>"
+        raise TypeError(type(obj))
+
+    print(json.dumps(messages, indent=2, ensure_ascii=False, default=serialize))
+
+
+def test_dataset(name, cfg):
+    print(f"\n{'='*60}")
+    print(f"Dataset: {name}")
+    print(f"  annotation: {cfg['annotation_path']}")
+    print(f"  data_path:  {cfg['data_path']}")
+
+    ann_path = Path(cfg["annotation_path"])
+    if not ann_path.exists():
+        print(f"  [SKIP] annotation file not found")
+        return
+
+    try:
+        item = load_first_item(str(ann_path))
+    except Exception as e:
+        print(f"  [FAIL] load_first_item: {e}")
+        return
+
+    data_path = Path(cfg["data_path"])
+    try:
+        messages = _build_messages(item, data_path)
+        print(f"  [OK] _build_messages succeeded, {len(messages)} messages")
+        summarize_messages(messages)
+    except Exception as e:
+        print(f"  [FAIL] _build_messages: {e}")
+        import traceback; traceback.print_exc()
+
+
 def main():
-    print(f"Loading first item from: {ANNOTATION_PATH}")
-    item = load_first_item(ANNOTATION_PATH)
-    item["data_path"] = DATA_PATH
+    for name, cfg in DATASETS.items():
+        test_dataset(name, cfg)
 
-    print("\n=== Raw dataset item ===")
-    print(json.dumps(item, indent=2, ensure_ascii=False))
-
-    # ── Step 1: _build_messages ──────────────────────────────────────────────
-    messages = _build_messages(item, Path(DATA_PATH))
-
-    print("\n=== Messages before apply_chat_template ===")
-    print(json.dumps(messages, indent=2, ensure_ascii=False))
-
-    print("\n=== Summary ===")
-    for i, msg in enumerate(messages):
-        if isinstance(msg["content"], str):
-            content_types = ["text"]
-            preview = msg["content"][:80]
-        else:
-            content_types = [c["type"] for c in msg["content"]]
-            preview = " | ".join(
-                str(c.get("text", c.get("image", c.get("video", ""))))[:40]
-                for c in msg["content"]
-            )
-        print(f"  [{i}] role={msg['role']:<10} types={content_types}")
-        print(f"       preview: {preview}")
-
-    # ── Step 2: preprocess_qwen_visual (requires loading processor) ──────────
-    print(f"\nLoading processor from: {MODEL_PATH}")
-    from transformers import AutoProcessor
-    processor = AutoProcessor.from_pretrained(MODEL_PATH)
-
-    data_dict = preprocess_qwen_visual([item], processor)
-
-    tokenizer = processor.tokenizer
-    IGNORE_INDEX = -100
-
-    decoded_input = tokenizer.decode(data_dict["input_ids"][0], skip_special_tokens=False)
-    print("\n=== Decoded input_ids (full prompt seen by model) ===")
-    print(decoded_input)
-
-    label_ids = [
-        tid if tid != IGNORE_INDEX else tokenizer.pad_token_id
-        for tid in data_dict["labels"][0].tolist()
-    ]
-    decoded_labels = tokenizer.decode(label_ids, skip_special_tokens=False)
-    print("\n=== Decoded labels (what the model is trained to predict) ===")
-    print(decoded_labels)
-
-    n_label_tokens = sum(1 for t in data_dict["labels"][0].tolist() if t != IGNORE_INDEX)
-    print(f"\nTotal tokens: {data_dict['input_ids'].shape[1]}  |  Label tokens: {n_label_tokens}")
+    print(f"\n{'='*60}")
+    print("All datasets tested.")
 
 
 if __name__ == "__main__":
