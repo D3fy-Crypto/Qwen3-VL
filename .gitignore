@@ -1,0 +1,9 @@
+# Editor
+.vscode/
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
