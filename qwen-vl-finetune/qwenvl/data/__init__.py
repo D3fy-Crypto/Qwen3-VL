@@ -9,12 +9,12 @@ R2R = {
 
 ENVDROP = {
     "annotation_path": f"{NAVILA_BASE}/EnvDrop/annotations.json",
-    "data_path": f"{NAVILA_BASE}/R2R/train",
+    "data_path": f"{NAVILA_BASE}/EnvDrop/train",
 }
 
 HUMAN = {
     "annotation_path": f"{NAVILA_BASE}/Human/annotations.json",
-    "data_path": f"{NAVILA_BASE}/R2R/train",
+    "data_path": f"{NAVILA_BASE}/Human/raw_frames",
 }
 
 RXR = {
