@@ -1,11 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=qwen3vl_sft
-#SBATCH --partition=a100
-#SBATCH --gres=gpu:a100:4
-#SBATCH --cpus-per-task=40
-#SBATCH --mem=64G
-#SBATCH --time=3-00:00:00
-#SBATCH --account=tinoosh
+#SBATCH --job-name=qwen3vl_sft_gru
+#SBATCH --partition=l40s
+#SBATCH --gres=gpu:l40s:8
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=256G
+#SBATCH --time=24:00:00
 #SBATCH --output=/scratch/tinoosh/chang/logs/%j_%x.out
 #SBATCH --error=/scratch/tinoosh/chang/logs/%j_%x.err
 #SBATCH --nodes=1
@@ -14,42 +13,42 @@
 # ============================================================
 # Configurable — edit these before submitting
 # ============================================================
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
-MODEL_PATH="/home/djonna1/scratchtinoosh/iros_dataset/Qwen-Model/instruct"
-DATASETS="r2r,human,rxr,scanqa"
-RUN_NAME="qwen3vl-sft-$(date +%Y%m%d-%H%M)"
+MODEL_PATH="/weka/scratch/tinoosh/iros_dataset/Qwen-Model/instruct"
+GRU_WARMSTART="/weka/scratch/tinoosh/iros_dataset/Qwen-Model/gru_ckpt/model.safetensors"
+DATASETS="human"
+RUN_NAME="qwen3vl-gru-sft-$(date +%Y%m%d-%H%M)"
 OUTPUT_DIR="/scratch/tinoosh/chang/checkpoints/${RUN_NAME}"
-WANDB_PROJECT="qwen3vl-sft"
+WANDB_PROJECT="qwen3vl-gru-sft"
 
 LR=1e-4
-BATCH_SIZE=4
-GRAD_ACCUM=10
+BATCH_SIZE=2
+GRAD_ACCUM=8
 EPOCHS=1
-MODEL_MAX_LENGTH=4096
+MODEL_MAX_LENGTH=8192   # longer context for long-horizon trajectories
 
 if [[ "${SMOKE:-0}" == "1" ]]; then
-    BATCH_SIZE=4
-    GRAD_ACCUM=10
-    NPROC_OVERRIDE=4
-    MODEL_MAX_LENGTH=4096
-    MAX_STEPS_ARG=""
-    SAVE_STRATEGY_ARG="--save_strategy steps --save_steps 50 --save_total_limit 2"
-    REPORT_ARG="--report_to wandb"
-    TUNE_LLM_ARG="--tune_mm_llm True"
-    PIXELS_ARG="--max_pixels 50176 --min_pixels 784"
-    WORKERS_ARG="--dataloader_num_workers 8"
+    BATCH_SIZE=2
+    GRAD_ACCUM=2
+    NPROC_OVERRIDE=2
+    MODEL_MAX_LENGTH=2048
+    MAX_STEPS_ARG="--max_steps 10"
+    SAVE_STRATEGY_ARG="--save_strategy steps --save_steps 500 --save_total_limit 2"
+    REPORT_ARG="--report_to none"
+    TUNE_LLM_ARG="--tune_mm_llm True --tune_qwen_lm True"
+    PIXELS_ARG="--max_pixels 4096 --min_pixels 784"
+    WORKERS_ARG="--dataloader_num_workers 4"
     DEEPSPEED_ARG="--deepspeed ./scripts/zero3.json"
-    RUN_NAME="smoke-$(date +%Y%m%d-%H%M)"
+    RUN_NAME="smoke-gru-$(date +%Y%m%d-%H%M)"
     OUTPUT_DIR="/scratch/tinoosh/chang/checkpoints/${RUN_NAME}"
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 else
-    NPROC_OVERRIDE=4
+    NPROC_OVERRIDE=8
     MAX_STEPS_ARG=""
     SAVE_STRATEGY_ARG="--save_strategy steps --save_steps 500 --save_total_limit 2"
     REPORT_ARG="--report_to wandb"
-    TUNE_LLM_ARG="--tune_mm_llm True"
+    TUNE_LLM_ARG="--tune_mm_llm True --tune_qwen_lm True"
     PIXELS_ARG="--max_pixels 50176 --min_pixels 784"
-    WORKERS_ARG="--dataloader_num_workers 8"
+    WORKERS_ARG="--dataloader_num_workers 4"
     DEEPSPEED_ARG="--deepspeed ./scripts/zero3.json"
 fi
 # ============================================================
@@ -78,6 +77,7 @@ echo "========================================"
 echo "Job ID      : ${SLURM_JOB_ID}"
 echo "Node        : ${SLURM_NODELIST}"
 echo "Model       : ${MODEL_PATH}"
+echo "Warmstart   : ${GRU_WARMSTART}"
 echo "Dataset     : ${DATASETS}"
 echo "Output Dir  : ${OUTPUT_DIR}"
 echo "Run Name    : ${RUN_NAME}"
@@ -90,15 +90,17 @@ torchrun \
     --nproc_per_node=${NPROC_PER_NODE} \
     --master_addr=${MASTER_ADDR} \
     --master_port=${MASTER_PORT} \
-    qwenvl/train/train_qwen.py \
+    qwenvl/train/train_gru_sft_qwen.py \
         ${DEEPSPEED_ARG} \
         --model_name_or_path "${MODEL_PATH}" \
+        --gru_warmstart_ckpt "${GRU_WARMSTART}" \
         --model_type qwen3vl \
         --dataset_use "${DATASETS}" \
-        --data_flatten True \
         --tune_mm_vision True \
         --tune_mm_mlp True \
         ${TUNE_LLM_ARG} \
+        --tune_projector True \
+        --tune_qwen_vision False \
         --bf16 \
         --output_dir "${OUTPUT_DIR}" \
         --num_train_epochs ${EPOCHS} \

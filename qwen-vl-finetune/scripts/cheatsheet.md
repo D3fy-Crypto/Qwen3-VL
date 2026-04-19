@@ -16,3 +16,5 @@ squeue -j 1299671 -o "%i %u %j %N %T"
 
 time left
 squeue -p a100 -t R -o "%i %u %L %N"
+
+squeue -p a100 -t R -o "%i %u %L %N" | sort -k3

@@ -39,8 +39,19 @@ def read_jsonl(path):
         return [json.loads(line) for line in f]
 
 
+class _MissingImage(PILImage.Image):
+    """Sentinel subclass returned when an image file is not found."""
+    pass
+
+
 def _make_abs_paths(base: Path, files: str) -> PILImage.Image:
-    return PILImage.open((base / files).resolve()).convert("RGB")
+    try:
+        return PILImage.open((base / files).resolve()).convert("RGB")
+    except FileNotFoundError:
+        logging.warning(f"Missing image: {base / files}, using black frame.")
+        img = PILImage.new("RGB", (224, 224))
+        img.__class__ = _MissingImage
+        return img
 
 
 def update_processor_pixels(processor, data_args):
@@ -144,16 +155,12 @@ NUM_HISTORICAL_FRAMES = 7
 
 def _sample_frame_indices(total_frames: int, num_frames: int) -> List[int]:
     """Uniformly sample num_frames indices from total_frames.
-    If total_frames < num_frames, repeats frame 0 at the front (same as _vlnce_sample_indices).
-    If total_frames > num_frames, uniformly downsamples via linspace.
+    Caller is responsible for padding if total_frames < num_frames.
     """
-    if total_frames <= 0:
-        return [0] * num_frames
-    padded = max(0, num_frames - total_frames)
-    effective_len = total_frames + padded
-    sampled = np.linspace(0, effective_len - 1, num=num_frames - 1, endpoint=False, dtype=int).tolist()
-    sampled.append(effective_len - 1)
-    return [max(0, idx - padded) for idx in sampled]
+    if total_frames <= 0 or num_frames <= 0:
+        return []
+    n = min(total_frames, num_frames)
+    return np.linspace(0, total_frames - 1, num=n, dtype=int).tolist()
 
 
 def _extract_video_frames(video_path: str, num_frames: int) -> List[PILImage.Image]:
@@ -174,7 +181,7 @@ def _extract_video_frames(video_path: str, num_frames: int) -> List[PILImage.Ima
     return frames
 
 
-def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any]]:
+def _build_messages(item: Dict[str, Any], base_path: Path) -> Tuple[List[Dict[str, Any]], bool]:
     system_prompt = "You are a helpful navigation assistant."
     messages = [{"role": "system", "content": [{"type": "text", "text": system_prompt}]}]
 
@@ -189,24 +196,29 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any
         ]
         messages.append({"role": "user", "content": content})
         messages.append({"role": "assistant", "content": [{"type": "text", "text": answer}]})
-        return messages
+        return messages, False
 
     frames = item["frames"]
     if len(frames) < 1:
         raise ValueError(f"item has no frames: {item.get('video_id', '')}")
-    current = frames[-1]            # last frame is current observation
-    historical_pool = frames[:-1] if len(frames) > 1 else [frames[0]]
+    current = frames[-1]
+    historical_pool = frames[:-1] if len(frames) > 1 else []
 
-    # Always produce exactly NUM_HISTORICAL_FRAMES historical frames.
-    # Too many → uniform downsample; too few → repeat frame 0 (same as _vlnce_sample_indices).
+    # Uniformly sample up to NUM_HISTORICAL_FRAMES from pool; prepend black frames if not enough.
     indices = _sample_frame_indices(len(historical_pool), NUM_HISTORICAL_FRAMES)
-    historical = [historical_pool[i] for i in indices]
+    loaded_historical = [_make_abs_paths(base_path, historical_pool[i]) for i in indices]
+    pad_count = NUM_HISTORICAL_FRAMES - len(loaded_historical)
+    black_frame = PILImage.new("RGB", (224, 224))
+    loaded_historical = [black_frame] * pad_count + loaded_historical
+
+    loaded_current = _make_abs_paths(base_path, current)
+    has_missing = any(isinstance(f, _MissingImage) for f in loaded_historical) or isinstance(loaded_current, _MissingImage)
 
     content = [
         {"type": "text", "text": "Imagine you are a robot programmed for navigation tasks. You have been given a video of historical observations:"},
-        *[{"type": "image", "image": _make_abs_paths(base_path, f)} for f in historical],
+        *[{"type": "image", "image": f} for f in loaded_historical],
         {"type": "text", "text": "and current observation:"},
-        {"type": "image", "image": _make_abs_paths(base_path, current)},
+        {"type": "image", "image": loaded_current},
         {"type": "text", "text": (
             f"Your assigned task is: {item['q']}\n"
             "Analyze this series of images to decide your next move, which could involve "
@@ -217,7 +229,7 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any
     messages.append({"role": "user", "content": content})
     messages.append({"role": "assistant", "content": [{"type": "text", "text": item["a"]}]})
 
-    return messages
+    return messages, has_missing
 
 
 def preprocess_qwen_visual(
@@ -229,7 +241,7 @@ def preprocess_qwen_visual(
 
     source = sources[0]
     base_path = Path(source.get("data_path", ""))
-    messages = _build_messages(source, base_path)
+    messages, has_missing = _build_messages(source, base_path)
 
     full_result = processor.apply_chat_template(
         messages, tokenize=True, return_dict=True, return_tensors="pt"
@@ -256,6 +268,9 @@ def preprocess_qwen_visual(
                 ]
                 pos = ans_end
         pos += 1
+
+    if has_missing:
+        labels = torch.full_like(input_ids, IGNORE_INDEX)
 
     full_result["labels"] = labels
     full_result["input_ids"] = input_ids
@@ -365,47 +380,31 @@ class LazySupervisedDataset(Dataset):
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         num_base_retries = 3
-        num_final_retries = 30
 
-        # try the current sample first
+        # missing file: skip forward immediately, no sleep
+        next_index = i
+        for _ in range(num_base_retries):
+            try:
+                sources = self.list_data_dict[next_index]
+                if isinstance(sources, dict):
+                    sources = [sources]
+                return self.item_fn(sources)
+            except FileNotFoundError as e:
+                print(f"[Skip] Missing file for sample {next_index}, trying next. {e}")
+                next_index = min(next_index + 1, len(self.list_data_dict) - 1)
+
+        # transient error: retry current sample with sleep
         for attempt_idx in range(num_base_retries):
             try:
                 sources = self.list_data_dict[i]
                 if isinstance(sources, dict):
                     sources = [sources]
-                sample = self.item_fn(sources)
-                return sample
+                return self.item_fn(sources)
             except Exception as e:
-                # sleep 1s in case it is a cloud disk issue
                 print(f"[Try #{attempt_idx}] Failed to fetch sample {i}. Exception:", e)
                 time.sleep(1)
 
-        # try other samples, in case it is file corruption issue
-        for attempt_idx in range(num_base_retries):
-            try:
-                next_index = min(i + 1, len(self.list_data_dict) - 1)
-                sources = self.list_data_dict[next_index]
-                if isinstance(sources, dict):
-                    sources = [sources]
-
-                sample = self.item_fn(sources)
-                return sample
-            except Exception as e:
-                # no need to sleep
-                print(
-                    f"[Try other #{attempt_idx}] Failed to fetch sample {next_index}. Exception:",
-                    e,
-                )
-                pass
-
-        try:
-            sources = self.list_data_dict[i]
-            if isinstance(sources, dict):
-                sources = [sources]
-            sample = self.item_fn(sources)
-            return sample
-        except Exception as e:
-            raise e
+        raise RuntimeError(f"Failed to fetch any valid sample after retries, last index {i}.")
 
     def _get_item(self, sources) -> Dict[str, torch.Tensor]:
         data_dict = preprocess_qwen_visual(
