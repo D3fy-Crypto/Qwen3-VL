@@ -107,6 +107,61 @@ def strip_vision_batch(batch, tokenizer):
     return batch
 
 
+def collect_gru_motion_diagnostics(model, batch, motion_token_id):
+    with torch.no_grad():
+        gru_features_in = batch["gru_features"].to(model.device)
+        gru_lengths_in = batch["gru_lengths"].to(model.device)
+        if gru_features_in.dim() == 4:
+            bsz, num_slots, max_t, feat_dim = gru_features_in.shape
+            flat_features = gru_features_in.reshape(bsz * num_slots, max_t, feat_dim)
+            flat_lengths = gru_lengths_in.reshape(bsz * num_slots).clamp(min=1, max=max_t)
+            flat_hidden = model.trajectory_gru.encode_sequence(flat_features, flat_lengths)
+            flat_last_idx = (flat_lengths - 1).to(dtype=torch.long)
+            flat_last = flat_hidden[
+                torch.arange(flat_hidden.shape[0], device=flat_hidden.device),
+                flat_last_idx,
+                :,
+            ]
+            projected = model.projector(flat_last).reshape(bsz, num_slots, -1)
+            gru_hidden = flat_hidden.reshape(bsz, num_slots, max_t, -1)
+        else:
+            gru_hidden = model.trajectory_gru.encode_sequence(gru_features_in, gru_lengths_in)
+            projected = model.projector(gru_hidden)
+
+    ids0 = batch["input_ids"][0].tolist()
+    motion_positions = [i for i, t in enumerate(ids0) if int(t) == int(motion_token_id)]
+    if batch["gru_lengths"].dim() == 2:
+        seq_len0 = int((batch["gru_lengths"][0] > 0).sum().item())
+    else:
+        seq_len0 = int(batch["gru_lengths"][0])
+    seq_len0 = max(1, seq_len0)
+    seq_len0 = min(seq_len0, int(projected.shape[1]))
+    use_n = min(len(motion_positions), seq_len0)
+
+    if batch["gru_features"].dim() == 4:
+        gru_input_shapes = [list(batch["gru_features"][0][i].shape) for i in range(seq_len0)]
+        gru_input_vals = [
+            batch["gru_features"][0][i][: int(batch["gru_lengths"][0][i])].tolist()
+            for i in range(seq_len0)
+        ]
+    else:
+        gru_input_shapes = [list(batch["gru_features"][0][i].shape) for i in range(seq_len0)]
+        gru_input_vals = batch["gru_features"][0][:seq_len0].tolist()
+
+    return {
+        "gru_input_shape": list(batch["gru_features"].shape),
+        "gru_lengths_shape": list(batch["gru_lengths"].shape),
+        "gru_hidden_shape": list(gru_hidden.shape),
+        "projected_shape": list(projected.shape),
+        "gru_input_per_slot_shape_0": gru_input_shapes,
+        "motion_output_per_slot_shape_0": [list(projected[0, i].shape) for i in range(use_n)],
+        "gru_input_per_slot_0": gru_input_vals,
+        "motion_output_per_slot_0": projected[0, :use_n, :].detach().cpu().float().tolist(),
+        "motion_positions_0": motion_positions,
+        "motion_slots_used_0": use_n,
+    }
+
+
 def render_debug_html(payload):
         prompt = html.escape(str(payload.get("raw_prompt_0", "")))
         source_json = html.escape(json.dumps(payload.get("raw_source_0", {}), indent=2, ensure_ascii=False))
@@ -115,6 +170,9 @@ def render_debug_html(payload):
         motion_positions = html.escape(json.dumps(payload.get("motion_positions_0", []), ensure_ascii=False))
         input_ids = html.escape(json.dumps(payload.get("input_ids_0", []), ensure_ascii=False))
         gru_features = html.escape(json.dumps(payload.get("gru_features_0", []), indent=2, ensure_ascii=False))
+        gru_diag = html.escape(json.dumps(payload.get("gru_motion_diagnostics", {}), indent=2, ensure_ascii=False))
+        gru_inputs = html.escape(json.dumps(payload.get("gru_motion_diagnostics", {}).get("gru_input_per_slot_0", []), indent=2, ensure_ascii=False))
+        motion_outputs = html.escape(json.dumps(payload.get("gru_motion_diagnostics", {}).get("motion_output_per_slot_0", []), indent=2, ensure_ascii=False))
         logits_shape = html.escape(json.dumps(payload.get("logits_shape", None), ensure_ascii=False))
         loss = html.escape(str(payload.get("loss", None)))
         disable_vision = html.escape(str(payload.get("disable_vision", None)))
@@ -189,8 +247,6 @@ def render_debug_html(payload):
             font-size: 13px;
         }}
         .wide {{ grid-column: 1 / -1; }}
-        .warn {{ color: #fca5a5; }}
-        .ok {{ color: #86efac; }}
         .stats {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }}
         .stat {{ padding: 12px 14px; border: 1px solid var(--border); border-radius: 14px; background: rgba(255,255,255,0.02); }}
         .stat .label {{ color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }}
@@ -241,6 +297,21 @@ def render_debug_html(payload):
             <section class=\"card\">
                 <h2>GRU Features</h2>
                 <div class=\"body\"><pre>{gru_features}</pre></div>
+            </section>
+
+            <section class=\"card\">
+                <h2>GRU I/O Shapes</h2>
+                <div class=\"body\"><pre>{gru_diag}</pre></div>
+            </section>
+
+            <section class=\"card wide\">
+                <h2>GRU Inputs Per Motion Slot</h2>
+                <div class=\"body\"><pre>{gru_inputs}</pre></div>
+            </section>
+
+            <section class=\"card wide\">
+                <h2>Projected Motion Outputs Per Slot (1x4096 each)</h2>
+                <div class=\"body\"><pre>{motion_outputs}</pre></div>
             </section>
 
             <section class=\"card\">
@@ -377,8 +448,19 @@ def main():
     motion_positions = [i for i, t in enumerate(ids0) if int(t) == motion_token_id]
     print(f"input_ids_len: {len(ids0)}")
     print(f"motion_positions: {motion_positions}")
-    print(f"gru_lengths[0]: {int(batch['gru_lengths'][0])}")
+    if batch["gru_lengths"].dim() == 2:
+        print(f"gru_lengths[0]: {batch['gru_lengths'][0].tolist()}")
+    else:
+        print(f"gru_lengths[0]: {int(batch['gru_lengths'][0])}")
     print(f"gru_features[0]_shape: {tuple(batch['gru_features'][0].shape)}")
+
+    gru_diag = collect_gru_motion_diagnostics(model, batch, motion_token_id)
+    print(f"gru_input_shape: {tuple(gru_diag['gru_input_shape'])}")
+    print(f"gru_lengths_shape: {tuple(gru_diag['gru_lengths_shape'])}")
+    print(f"gru_hidden_shape: {tuple(gru_diag['gru_hidden_shape'])}")
+    print(f"projected_shape: {tuple(gru_diag['projected_shape'])}")
+    print(f"motion_output_per_slot_shapes_0: {gru_diag['motion_output_per_slot_shape_0']}")
+
     print("raw_prompt_0:")
     print(raw_debug["raw_prompt"])
 
@@ -395,6 +477,7 @@ def main():
             "motion_positions_0": motion_positions,
             "gru_lengths": batch["gru_lengths"].tolist(),
             "gru_features_0": batch["gru_features"][0].tolist(),
+            "gru_motion_diagnostics": gru_diag,
             "logits_shape": list(outputs["logits"].shape) if outputs.get("logits") is not None else None,
             "loss": float(outputs["loss"]) if outputs.get("loss") is not None else None,
         }

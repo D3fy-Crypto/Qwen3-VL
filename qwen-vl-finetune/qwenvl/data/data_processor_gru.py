@@ -510,37 +510,70 @@ class LazySupervisedDataset(Dataset):
                 cumulative[step] = list(running)
             self.traj_cumulative_actions[traj] = cumulative
 
-    def _runtime_native_gru_features(self, source_item: Dict[str, Any]) -> Tuple[torch.Tensor, List[str], List[int]]:
+    def _cumulative_actions_until_inclusive(self, traj: str, step_inclusive: int) -> List[int]:
+        if step_inclusive < 0:
+            return []
+
+        cumulative = self.traj_cumulative_actions.get(traj, {})
+        if not cumulative:
+            return []
+
+        use_step = None
+        for s in sorted(cumulative.keys()):
+            if s <= step_inclusive:
+                use_step = s
+            else:
+                break
+
+        if use_step is None:
+            return []
+        return cumulative.get(use_step, [])
+
+    def _runtime_native_gru_features(self, source_item: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor, List[str], List[int]]:
         slots = self.gru_history_slots
-        selected = select_frame_slots(source_item.get("frames") or [], slots=slots)
+        frames = source_item.get("frames") or []
+        selected = select_frame_slots(frames, slots=slots)
         frame_ids = [frame_rel for _, frame_rel in selected]
 
         traj, cur_step = split_video_id(str(source_item.get("video_id", "")))
-        cumulative = self.traj_cumulative_actions.get(traj, {})
+        frame_count = max(1, len(frames))
 
-        if slots <= 1:
-            target_steps = [max(0, cur_step)]
+        # Map each selected frame index to the observed trajectory step for this sample.
+        # This keeps frame-slot semantics consistent and avoids slot-only interpolation drift.
+        if frame_count <= 1:
+            observed_steps = [max(0, cur_step)]
         else:
-            target_steps = [int(round(i * max(0, cur_step) / (slots - 1))) for i in range(slots)]
+            observed_steps = [
+                int(round(frame_idx * max(0, cur_step) / (frame_count - 1)))
+                for frame_idx, _ in selected
+            ]
 
-        rows: List[torch.Tensor] = []
-        available_steps = sorted(cumulative.keys())
-        for step_target in target_steps:
-            step_use = None
-            for s in available_steps:
-                if s <= step_target:
-                    step_use = s
-                else:
-                    break
-
-            action_seq = cumulative.get(step_use, []) if step_use is not None else []
+        slot_prefixes: List[torch.Tensor] = []
+        slot_lengths: List[int] = []
+        for observed_step in observed_steps:
+            # Strict no-future rule: slot at observed step t only sees actions before t.
+            action_seq = self._cumulative_actions_until_inclusive(traj, observed_step - 1)
             if len(action_seq) == 0:
-                feat = actions_to_motion_features([STOP])[-1]
+                prefix = actions_to_motion_features([STOP])
             else:
-                feat = actions_to_motion_features(action_seq)[-1]
-            rows.append(feat)
+                prefix = actions_to_motion_features(action_seq)
+            slot_prefixes.append(prefix)
+            slot_lengths.append(int(prefix.size(0)))
 
-        return torch.stack(rows, dim=0), frame_ids, target_steps
+        max_t = max(slot_lengths) if slot_lengths else 1
+        padded_prefixes: List[torch.Tensor] = []
+        for prefix in slot_prefixes:
+            if prefix.size(0) < max_t:
+                pad = torch.zeros((max_t - prefix.size(0), prefix.size(1)), dtype=prefix.dtype)
+                prefix = torch.cat([prefix, pad], dim=0)
+            padded_prefixes.append(prefix)
+
+        return (
+            torch.stack(padded_prefixes, dim=0),
+            torch.tensor(slot_lengths, dtype=torch.long),
+            frame_ids,
+            observed_steps,
+        )
 
     @property
     def lengths(self):
@@ -686,7 +719,7 @@ class LazySupervisedDataset(Dataset):
         label = self.processor.tokenizer.decode(labels, skip_special_tokens=False)
 
         if is_native:
-            gru_features, frame_ids, step_targets = self._runtime_native_gru_features(source_item)
+            gru_features, gru_lengths, frame_ids, step_targets = self._runtime_native_gru_features(source_item)
             data_dict["frame_ids"] = frame_ids
             data_dict["frame_step_targets"] = step_targets
         else:
@@ -704,10 +737,12 @@ class LazySupervisedDataset(Dataset):
                         f"Sample has short GRU sequence len={len(raw_actions)} < {min_seq_len}"
                     )
 
-            gru_features = actions_to_motion_features(raw_actions)
+            gru_features = actions_to_motion_features(raw_actions).unsqueeze(0)
+            gru_lengths = torch.tensor([int(gru_features.size(1))], dtype=torch.long)
 
         data_dict["gru_features"] = gru_features
-        data_dict["gru_length"] = torch.tensor(gru_features.size(0), dtype=torch.long)
+        data_dict["gru_lengths"] = gru_lengths
+        data_dict["gru_length"] = torch.tensor(int(gru_features.size(0)), dtype=torch.long)
 
         # Motion-token diagnostics used by debug scripts and forward alignment checks.
         motion_token_text = getattr(self.data_args, "motion_token_text", DEFAULT_MOTION_TOKEN)
@@ -813,6 +848,31 @@ def pad_and_cat(tensor_list):
     return stacked_tensor
 
 
+def collate_gru_prefixes(instances: Sequence[Dict]) -> Tuple[torch.Tensor, torch.Tensor]:
+    gru_features = [instance["gru_features"] for instance in instances]
+    gru_lengths = [instance.get("gru_lengths") for instance in instances]
+
+    max_slots = max(int(feat.size(0)) for feat in gru_features)
+    max_t = max(int(feat.size(1)) for feat in gru_features)
+    feat_dim = int(gru_features[0].size(2))
+
+    feat_batch = torch.zeros(
+        (len(instances), max_slots, max_t, feat_dim),
+        dtype=gru_features[0].dtype,
+    )
+    len_batch = torch.zeros((len(instances), max_slots), dtype=torch.long)
+
+    for i, feat in enumerate(gru_features):
+        s, t, _ = feat.shape
+        feat_batch[i, :s, :t, :] = feat
+        gl = gru_lengths[i]
+        if gl is None:
+            gl = torch.full((s,), int(t), dtype=torch.long)
+        len_batch[i, :s] = gl[:s]
+
+    return feat_batch, len_batch
+
+
 @dataclass
 class DataCollatorForSupervisedDataset(object):
     """Collate examples for supervised fine-tuning."""
@@ -882,14 +942,9 @@ class DataCollatorForSupervisedDataset(object):
         batch["position_ids"] = position_ids
 
         if all("gru_features" in instance for instance in instances):
-            gru_features = [instance["gru_features"] for instance in instances]
-            gru_lengths = torch.tensor(
-                [int(instance["gru_length"]) for instance in instances], dtype=torch.long
-            )
-            batch["gru_features"] = torch.nn.utils.rnn.pad_sequence(
-                gru_features, batch_first=True, padding_value=0.0
-            )
-            batch["gru_lengths"] = gru_lengths
+            feat_batch, len_batch = collate_gru_prefixes(instances)
+            batch["gru_features"] = feat_batch
+            batch["gru_lengths"] = len_batch
 
         if all("motion_token_id" in instance for instance in instances):
             batch["motion_token_id"] = int(instances[0]["motion_token_id"])
@@ -975,14 +1030,9 @@ class FlattenedDataCollatorForSupervisedDataset(DataCollatorForSupervisedDataset
         batch["video_grid_thw"] = video_grid_thw
 
         if all("gru_features" in instance for instance in instances):
-            gru_features = [instance["gru_features"] for instance in instances]
-            gru_lengths = torch.tensor(
-                [int(instance["gru_length"]) for instance in instances], dtype=torch.long
-            )
-            batch["gru_features"] = torch.nn.utils.rnn.pad_sequence(
-                gru_features, batch_first=True, padding_value=0.0
-            )
-            batch["gru_lengths"] = gru_lengths
+            feat_batch, len_batch = collate_gru_prefixes(instances)
+            batch["gru_features"] = feat_batch
+            batch["gru_lengths"] = len_batch
 
         if all("motion_token_id" in instance for instance in instances):
             batch["motion_token_id"] = int(instances[0]["motion_token_id"])

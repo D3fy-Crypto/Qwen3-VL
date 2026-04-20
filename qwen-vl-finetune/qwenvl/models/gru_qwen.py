@@ -198,8 +198,10 @@ class GRUQwenModel(nn.Module):
         Forward pass through GRU-Qwen model.
         
         Args:
-            gru_features: Trajectory features (batch_size, traj_seq_len, 7)
-            gru_lengths: Valid trajectory lengths (batch_size,)
+            gru_features: Trajectory features, either (batch_size, traj_seq_len, 7)
+                or per-slot prefixes (batch_size, num_slots, prefix_len, 7)
+            gru_lengths: Valid lengths matching gru_features shape, either (batch_size,)
+                or per-slot lengths (batch_size, num_slots)
             input_ids: Text token IDs (batch_size, text_seq_len)
             attention_mask: Attention mask for text tokens (batch_size, text_seq_len)
             pixel_values: Vision input (for multimodal Qwen models)
@@ -222,9 +224,25 @@ class GRUQwenModel(nn.Module):
             labels = labels.to(self.device)
         
         with torch.no_grad():
-            gru_hidden = self.trajectory_gru.encode_sequence(gru_features, gru_lengths)
+            if gru_features.dim() == 4:
+                bsz, num_slots, max_t, feat_dim = gru_features.shape
+                flat_features = gru_features.reshape(bsz * num_slots, max_t, feat_dim)
+                flat_lengths = gru_lengths.reshape(bsz * num_slots)
+                flat_lengths = flat_lengths.clamp(min=1, max=max_t)
 
-        projected = self.projector(gru_hidden)
+                flat_hidden = self.trajectory_gru.encode_sequence(flat_features, flat_lengths)
+                flat_last_idx = (flat_lengths - 1).to(dtype=torch.long)
+                flat_last = flat_hidden[
+                    torch.arange(flat_hidden.shape[0], device=flat_hidden.device),
+                    flat_last_idx,
+                    :,
+                ]
+
+                projected = self.projector(flat_last).reshape(bsz, num_slots, -1)
+                gru_hidden = flat_hidden.reshape(bsz, num_slots, max_t, -1)
+            else:
+                gru_hidden = self.trajectory_gru.encode_sequence(gru_features, gru_lengths)
+                projected = self.projector(gru_hidden)
 
         if input_ids is not None:
             input_embeds = self.qwen.get_input_embeddings()(input_ids)
@@ -242,7 +260,10 @@ class GRUQwenModel(nn.Module):
 
             placement_stats = []
             for b in range(combined_embeds.shape[0]):
-                seq_len = int(gru_lengths[b].item())
+                if gru_lengths.dim() == 2:
+                    seq_len = int((gru_lengths[b] > 0).sum().item())
+                else:
+                    seq_len = int(gru_lengths[b].item())
                 seq_len = max(1, min(seq_len, projected.shape[1]))
 
                 if self.motion_token_id is not None and self.motion_token_id >= 0:
