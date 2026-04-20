@@ -26,6 +26,9 @@ DEFAULT_IMAGE_TOKEN = "<image>"
 DEFAULT_VIDEO_TOKEN = "<video>"
 DEFAULT_MOTION_TOKEN = "<motion>"
 
+DEGREE_PATTERN = re.compile(r"(\d+)\s*degree", re.IGNORECASE)
+CM_PATTERN = re.compile(r"(\d+)\s*cm", re.IGNORECASE)
+
 STOP = 0
 FORWARD = 1
 TURN_LEFT = 2
@@ -88,6 +91,58 @@ def actions_to_motion_features(action_seq, theta0=0.0, step_m=0.25, turn_deg=15.
 
 def _make_abs_paths(base: Path, files: str) -> str:
     return f"{(base / files).resolve()}"
+
+
+def split_video_id(video_id: str) -> Tuple[str, int]:
+    if not isinstance(video_id, str) or "-" not in video_id:
+        return str(video_id), 0
+    traj, step = video_id.rsplit("-", 1)
+    try:
+        return traj, int(step)
+    except ValueError:
+        return traj, 0
+
+
+def action_codes_from_answer(answer: str) -> List[int]:
+    answer = (answer or "").lower()
+
+    if "right" in answer:
+        match = DEGREE_PATTERN.search(answer)
+        steps = int(match.group(1)) // 15 if match else 1
+        return [TURN_RIGHT] * max(1, steps)
+
+    if "left" in answer:
+        match = DEGREE_PATTERN.search(answer)
+        steps = int(match.group(1)) // 15 if match else 1
+        return [TURN_LEFT] * max(1, steps)
+
+    if "move forward" in answer or "forward" in answer:
+        match = CM_PATTERN.search(answer)
+        steps = int(match.group(1)) // 25 if match else 1
+        return [FORWARD] * max(1, steps)
+
+    return []
+
+
+def normalize_action_answer(answer: str) -> str:
+    text = (answer or "").strip()
+    low = text.lower()
+    prefix = "the next action is "
+    if low.startswith(prefix):
+        text = text[len(prefix) :].strip()
+    return text.rstrip(".")
+
+
+def select_frame_slots(frames: Sequence[str], slots: int = 8) -> List[Tuple[int, str]]:
+    if isinstance(frames, str):
+        frames = [frames]
+    frames = list(frames or [])
+    if len(frames) == 0:
+        raise ValueError("Sample has no frames")
+
+    n_slots = max(1, int(slots))
+    indices = np.linspace(0, len(frames) - 1, num=n_slots, dtype=int).tolist()
+    return [(int(i), frames[int(i)]) for i in indices]
 
 
 def update_processor_pixels(processor, data_args):
@@ -189,34 +244,68 @@ def update_processor_pixels(processor, data_args):
 def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any]]:
     # Native R2R/RxR annotation schema: {video_id, q, a, frames, ...}
     if "conversations" not in item and "q" in item and "a" in item and "frames" in item:
-        frames = item.get("frames") or []
-        if isinstance(frames, str):
-            frames = [frames]
-        if len(frames) == 0:
-            raise ValueError("Sample has no frames")
-
-        historical_pool = frames[:-1] if len(frames) > 1 else [frames[0]]
-        num_hist = min(7, len(historical_pool))
-        hist_indices = np.linspace(0, len(historical_pool) - 1, num=num_hist, dtype=int).tolist()
-        historical = [historical_pool[i] for i in hist_indices]
-        current = frames[-1]
-
-        raw_gru = item.get("gru", []) if isinstance(item, dict) else []
-        if not isinstance(raw_gru, list):
-            raw_gru = []
-        motion_prompt = " ".join([DEFAULT_MOTION_TOKEN] * min(max(1, len(raw_gru)), 64))
+        n_slots = int(item.get("_gru_history_slots", 8))
+        selected = select_frame_slots(item.get("frames") or [], slots=n_slots)
 
         user_content = [
-            {"type": "text", "text": f"Trajectory memory tokens: {motion_prompt}"},
-            {"type": "text", "text": "Historical observations:"},
-            *[{"type": "image", "image": _make_abs_paths(base_path, f)} for f in historical],
-            {"type": "text", "text": "Current observation:"},
-            {"type": "image", "image": _make_abs_paths(base_path, current)},
-            {"type": "text", "text": str(item.get("q", ""))},
+            {
+                "type": "text",
+                "text": (
+                    "You are a robot agent programmed for navigation tasks. "
+                    "Below are historical observations consisting of an image and "
+                    "trajectory memory tokens."
+                ),
+            },
         ]
+
+        for slot_idx, (_, frame_rel) in enumerate(selected):
+            if slot_idx < max(0, n_slots - 1):
+                title = f"History {slot_idx + 1}"
+            else:
+                title = "Current observation"
+            user_content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        f"{title}\\n"
+                        f"Frame id: {frame_rel}\\n"
+                        f"Trajectory memory tokens: {DEFAULT_MOTION_TOKEN}"
+                    ),
+                }
+            )
+            user_content.append(
+                {"type": "image", "image": _make_abs_paths(base_path, frame_rel)}
+            )
+
+        user_content.append(
+            {
+                "type": "text",
+                "text": (
+                    f"Instruction: {str(item.get('q', ''))}\\n\\n"
+                    "Predict the next navigation action. Valid answers should be concise, "
+                    "for example: 'turn left 15 degrees', 'turn right 30 degrees', "
+                    "'move forward 75 cm', or 'stop'."
+                ),
+            }
+        )
+
         return [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "You are a helpful navigation assistant.",
+                    }
+                ],
+            },
             {"role": "user", "content": user_content},
-            {"role": "assistant", "content": [{"type": "text", "text": str(item.get("a", ""))}]},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": normalize_action_answer(str(item.get("a", "")))}
+                ],
+            },
         ]
 
     # Extract and normalize images and videos
@@ -383,8 +472,12 @@ class LazySupervisedDataset(Dataset):
         self.processor = processor
         self.tokenizer = processor.tokenizer
         self.data_args = data_args
+        self.gru_history_slots = max(1, int(getattr(data_args, "gru_history_slots", 8)))
         self.merge_size = getattr(processor.image_processor, "merge_size", 2)
         self.list_data_dict = list_data_dict
+
+        self.traj_cumulative_actions = {}
+        self._build_traj_action_index()
 
         if data_args.data_packing:
             self.item_fn = self._get_packed_item
@@ -393,6 +486,61 @@ class LazySupervisedDataset(Dataset):
 
     def __len__(self):
         return len(self.list_data_dict)
+
+    def _build_traj_action_index(self):
+        traj_steps: Dict[str, Dict[int, List[int]]] = {}
+        for ann in self.list_data_dict:
+            if not isinstance(ann, dict):
+                continue
+            if "conversations" in ann:
+                continue
+            if "video_id" not in ann or "a" not in ann:
+                continue
+
+            traj, step = split_video_id(str(ann.get("video_id", "")))
+            if traj not in traj_steps:
+                traj_steps[traj] = {}
+            traj_steps[traj][step] = action_codes_from_answer(str(ann.get("a", "")))
+
+        for traj, step_map in traj_steps.items():
+            running: List[int] = []
+            cumulative: Dict[int, List[int]] = {}
+            for step in sorted(step_map):
+                running.extend(step_map[step])
+                cumulative[step] = list(running)
+            self.traj_cumulative_actions[traj] = cumulative
+
+    def _runtime_native_gru_features(self, source_item: Dict[str, Any]) -> Tuple[torch.Tensor, List[str], List[int]]:
+        slots = self.gru_history_slots
+        selected = select_frame_slots(source_item.get("frames") or [], slots=slots)
+        frame_ids = [frame_rel for _, frame_rel in selected]
+
+        traj, cur_step = split_video_id(str(source_item.get("video_id", "")))
+        cumulative = self.traj_cumulative_actions.get(traj, {})
+
+        if slots <= 1:
+            target_steps = [max(0, cur_step)]
+        else:
+            target_steps = [int(round(i * max(0, cur_step) / (slots - 1))) for i in range(slots)]
+
+        rows: List[torch.Tensor] = []
+        available_steps = sorted(cumulative.keys())
+        for step_target in target_steps:
+            step_use = None
+            for s in available_steps:
+                if s <= step_target:
+                    step_use = s
+                else:
+                    break
+
+            action_seq = cumulative.get(step_use, []) if step_use is not None else []
+            if len(action_seq) == 0:
+                feat = actions_to_motion_features([STOP])[-1]
+            else:
+                feat = actions_to_motion_features(action_seq)[-1]
+            rows.append(feat)
+
+        return torch.stack(rows, dim=0), frame_ids, target_steps
 
     @property
     def lengths(self):
@@ -472,8 +620,23 @@ class LazySupervisedDataset(Dataset):
             raise e
 
     def _get_item(self, sources) -> Dict[str, torch.Tensor]:
+        source_item = sources[0] if isinstance(sources, list) and len(sources) > 0 else {}
+        is_native = (
+            isinstance(source_item, dict)
+            and "conversations" not in source_item
+            and "q" in source_item
+            and "a" in source_item
+            and "frames" in source_item
+        )
+
+        preprocess_sources = sources
+        if is_native:
+            patched = dict(source_item)
+            patched["_gru_history_slots"] = self.gru_history_slots
+            preprocess_sources = [patched]
+
         data_dict = preprocess_qwen_visual(
-            sources,
+            preprocess_sources,
             self.processor,
         )
 
@@ -522,22 +685,27 @@ class LazySupervisedDataset(Dataset):
         ]
         label = self.processor.tokenizer.decode(labels, skip_special_tokens=False)
 
-        source_item = sources[0] if isinstance(sources, list) and len(sources) > 0 else {}
-        raw_actions = source_item.get("gru", [])
-        if not isinstance(raw_actions, list):
-            raw_actions = []
-        raw_actions = [int(a) for a in raw_actions if isinstance(a, (int, float))]
+        if is_native:
+            gru_features, frame_ids, step_targets = self._runtime_native_gru_features(source_item)
+            data_dict["frame_ids"] = frame_ids
+            data_dict["frame_step_targets"] = step_targets
+        else:
+            raw_actions = source_item.get("gru", [])
+            if not isinstance(raw_actions, list):
+                raw_actions = []
+            raw_actions = [int(a) for a in raw_actions if isinstance(a, (int, float))]
 
-        min_seq_len = max(1, int(getattr(self.data_args, "gru_min_seq_len", 1)))
-        if len(raw_actions) < min_seq_len:
-            if getattr(self.data_args, "gru_fallback_to_stop", True):
-                raw_actions = [STOP] * min_seq_len
-            else:
-                raise ValueError(
-                    f"Sample has short GRU sequence len={len(raw_actions)} < {min_seq_len}"
-                )
+            min_seq_len = max(1, int(getattr(self.data_args, "gru_min_seq_len", 1)))
+            if len(raw_actions) < min_seq_len:
+                if getattr(self.data_args, "gru_fallback_to_stop", True):
+                    raw_actions = [STOP] * min_seq_len
+                else:
+                    raise ValueError(
+                        f"Sample has short GRU sequence len={len(raw_actions)} < {min_seq_len}"
+                    )
 
-        gru_features = actions_to_motion_features(raw_actions)
+            gru_features = actions_to_motion_features(raw_actions)
+
         data_dict["gru_features"] = gru_features
         data_dict["gru_length"] = torch.tensor(gru_features.size(0), dtype=torch.long)
 
