@@ -1,6 +1,11 @@
 import re
+from pathlib import Path
 
-NAVILA_BASE = "/weka/scratch/tinoosh/iros_dataset/NaVILA-Dataset"
+_LOCAL_NAVILA_BASE = Path("/home/rithvik/IROS_proj/NaVILA-Dataset")
+if _LOCAL_NAVILA_BASE.exists():
+    NAVILA_BASE = str(_LOCAL_NAVILA_BASE)
+else:
+    NAVILA_BASE = "/weka/scratch/tinoosh/iros_dataset/NaVILA-Dataset"
 
 R2R = {
     "annotation_path": f"{NAVILA_BASE}/R2R/annotations.json",
@@ -27,12 +32,18 @@ SCANQA = {
     "data_path": f"{NAVILA_BASE}/ScanQA/videos",
 }
 
+R2R_ALIGNMENT_QA = {
+    "annotation_path": "/home/rithvik/IROS_proj/llm_test/r2r_alignment_dataset_qa.json",
+    "data_path": "/home/rithvik/IROS_proj/llm_test",
+}
+
 data_dict = {
     "r2r": R2R,
     "envdrop": ENVDROP,
     "human": HUMAN,
     "rxr": RXR,
     "scanqa": SCANQA,
+    "r2r_alignment_qa": R2R_ALIGNMENT_QA,
 }
 
 

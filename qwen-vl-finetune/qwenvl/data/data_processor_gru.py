@@ -24,6 +24,10 @@ IMAGE_TOKEN_INDEX = 151655
 VIDEO_TOKEN_INDEX = 151656
 DEFAULT_IMAGE_TOKEN = "<image>"
 DEFAULT_VIDEO_TOKEN = "<video>"
+DEFAULT_MOTION_TOKEN = "<motion>"
+
+DEGREE_PATTERN = re.compile(r"(\d+)\s*degree", re.IGNORECASE)
+CM_PATTERN = re.compile(r"(\d+)\s*cm", re.IGNORECASE)
 
 STOP = 0
 FORWARD = 1
@@ -87,6 +91,68 @@ def actions_to_motion_features(action_seq, theta0=0.0, step_m=0.25, turn_deg=15.
 
 def _make_abs_paths(base: Path, files: str) -> str:
     return f"{(base / files).resolve()}"
+
+
+def split_video_id(video_id: str) -> Tuple[str, int]:
+    if not isinstance(video_id, str) or "-" not in video_id:
+        return str(video_id), 0
+    traj, step = video_id.rsplit("-", 1)
+    try:
+        return traj, int(step)
+    except ValueError:
+        return traj, 0
+
+
+def action_codes_from_answer(answer: str) -> List[int]:
+    answer = (answer or "").lower()
+
+    if "right" in answer:
+        match = DEGREE_PATTERN.search(answer)
+        steps = int(match.group(1)) // 15 if match else 1
+        return [TURN_RIGHT] * max(1, steps)
+
+    if "left" in answer:
+        match = DEGREE_PATTERN.search(answer)
+        steps = int(match.group(1)) // 15 if match else 1
+        return [TURN_LEFT] * max(1, steps)
+
+    if "move forward" in answer or "forward" in answer:
+        match = CM_PATTERN.search(answer)
+        steps = int(match.group(1)) // 25 if match else 1
+        return [FORWARD] * max(1, steps)
+
+    return []
+
+
+def normalize_action_answer(answer: str) -> str:
+    text = (answer or "").strip()
+    low = text.lower()
+    prefix = "the next action is "
+    if low.startswith(prefix):
+        text = text[len(prefix) :].strip()
+    return text.rstrip(".")
+
+
+def select_frame_slots(frames: Sequence[str], slots: int = 8) -> List[Tuple[int, str]]:
+    if isinstance(frames, str):
+        frames = [frames]
+    frames = list(frames or [])
+    if len(frames) == 0:
+        raise ValueError("Sample has no frames")
+
+    n_slots = max(1, int(slots))
+    indices = np.linspace(0, len(frames) - 1, num=n_slots, dtype=int).tolist()
+    return [(int(i), frames[int(i)]) for i in indices]
+
+
+def _extract_frame_index(frame_rel: str) -> Optional[int]:
+    match = re.search(r"frame_(\d+)\.(?:jpg|jpeg|png|webp)$", str(frame_rel), re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"frame_(\d+)$", str(frame_rel), re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    return None
 
 
 def update_processor_pixels(processor, data_args):
@@ -186,6 +252,72 @@ def update_processor_pixels(processor, data_args):
 
 
 def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any]]:
+    # Native R2R/RxR annotation schema: {video_id, q, a, frames, ...}
+    if "conversations" not in item and "q" in item and "a" in item and "frames" in item:
+        n_slots = int(item.get("_gru_history_slots", 8))
+        selected = select_frame_slots(item.get("frames") or [], slots=n_slots)
+
+        user_content = [
+            {
+                "type": "text",
+                "text": (
+                    "You are a robot agent programmed for navigation tasks. "
+                    "Below are historical observations consisting of an image and "
+                    "trajectory memory tokens."
+                ),
+            },
+        ]
+
+        for slot_idx, (_, frame_rel) in enumerate(selected):
+            if slot_idx < max(0, n_slots - 1):
+                title = f"History {slot_idx + 1}"
+            else:
+                title = "Current observation"
+            user_content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        f"{title}\\n"
+                        f"Frame id: {frame_rel}\\n"
+                        f"Trajectory memory tokens: {DEFAULT_MOTION_TOKEN}"
+                    ),
+                }
+            )
+            user_content.append(
+                {"type": "image", "image": _make_abs_paths(base_path, frame_rel)}
+            )
+
+        user_content.append(
+            {
+                "type": "text",
+                "text": (
+                    f"Instruction: {str(item.get('q', ''))}\\n\\n"
+                    "Predict the next navigation action. Valid answers should be concise, "
+                    "for example: 'turn left 15 degrees', 'turn right 30 degrees', "
+                    "'move forward 75 cm', or 'stop'."
+                ),
+            }
+        )
+
+        return [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "You are a helpful navigation assistant.",
+                    }
+                ],
+            },
+            {"role": "user", "content": user_content},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": normalize_action_answer(str(item.get("a", "")))}
+                ],
+            },
+        ]
+
     # Extract and normalize images and videos
     images = item.get("image") or []
     if isinstance(images, str):
@@ -206,12 +338,17 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any
     messages = []
     for turn in item["conversations"]:
         role = "user" if turn["from"] == "human" else "assistant"
-        text: str = turn["value"]
+        text: str = str(turn["value"])
 
         if role == "user":
+            # Normalize legacy placeholders and ensure at least one motion anchor is present.
+            text = text.replace("<gru>", DEFAULT_MOTION_TOKEN)
+            if DEFAULT_MOTION_TOKEN not in text:
+                text = f"{DEFAULT_MOTION_TOKEN}\n{text}"
+
             content = []
-            # Split text by <image> or <video> placeholders while keeping delimiters
-            text_parts = re.split(r"(<image>|<video>)", text)
+            # Split text by multimodal placeholders while keeping delimiters.
+            text_parts = re.split(r"(<image>|<video>|<motion>)", text)
 
             for seg in text_parts:
                 if seg == "<image>":
@@ -232,6 +369,9 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any
                             content.append({"type": "text", "text": "[missing_video]"})
                     else:
                         content.append({"type": "text", "text": "[missing_video]"})
+                elif seg == DEFAULT_MOTION_TOKEN:
+                    # Keep <motion> in user text so tokenizer emits a stable motion placeholder token.
+                    content.append({"type": "text", "text": DEFAULT_MOTION_TOKEN})
                 elif seg.strip():
                     content.append({"type": "text", "text": seg.strip()})
 
@@ -342,8 +482,12 @@ class LazySupervisedDataset(Dataset):
         self.processor = processor
         self.tokenizer = processor.tokenizer
         self.data_args = data_args
+        self.gru_history_slots = max(1, int(getattr(data_args, "gru_history_slots", 8)))
         self.merge_size = getattr(processor.image_processor, "merge_size", 2)
         self.list_data_dict = list_data_dict
+
+        self.traj_cumulative_actions = {}
+        self._build_traj_action_index()
 
         if data_args.data_packing:
             self.item_fn = self._get_packed_item
@@ -352,6 +496,98 @@ class LazySupervisedDataset(Dataset):
 
     def __len__(self):
         return len(self.list_data_dict)
+
+    def _build_traj_action_index(self):
+        traj_steps: Dict[str, Dict[int, List[int]]] = {}
+        for ann in self.list_data_dict:
+            if not isinstance(ann, dict):
+                continue
+            if "conversations" in ann:
+                continue
+            if "video_id" not in ann or "a" not in ann:
+                continue
+
+            traj, step = split_video_id(str(ann.get("video_id", "")))
+            if traj not in traj_steps:
+                traj_steps[traj] = {}
+            traj_steps[traj][step] = action_codes_from_answer(str(ann.get("a", "")))
+
+        for traj, step_map in traj_steps.items():
+            running: List[int] = []
+            cumulative: Dict[int, List[int]] = {}
+            for step in sorted(step_map):
+                running.extend(step_map[step])
+                cumulative[step] = list(running)
+            self.traj_cumulative_actions[traj] = cumulative
+
+    def _cumulative_actions_until_inclusive(self, traj: str, step_inclusive: int) -> List[int]:
+        if step_inclusive < 0:
+            return []
+
+        cumulative = self.traj_cumulative_actions.get(traj, {})
+        if not cumulative:
+            return []
+
+        use_step = None
+        for s in sorted(cumulative.keys()):
+            if s <= step_inclusive:
+                use_step = s
+            else:
+                break
+
+        if use_step is None:
+            return []
+        return cumulative.get(use_step, [])
+
+    def _runtime_native_gru_features(self, source_item: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor, List[str], List[int]]:
+        slots = self.gru_history_slots
+        frames = source_item.get("frames") or []
+        selected = select_frame_slots(frames, slots=slots)
+        frame_ids = [frame_rel for _, frame_rel in selected]
+
+        traj, _ = split_video_id(str(source_item.get("video_id", "")))
+
+        # Use the actual frame number for the cutoff rather than an interpolated slot anchor.
+        # This keeps "History N -> frame_k" aligned with the real prefix available at frame k,
+        # while still clamping to the observed trajectory length.
+        observed_steps: List[int] = []
+        for fallback_idx, frame_rel in selected:
+            frame_idx = _extract_frame_index(frame_rel)
+            if frame_idx is None:
+                frame_idx = int(fallback_idx)
+            observed_steps.append(max(0, int(frame_idx)))
+
+        slot_prefixes: List[torch.Tensor] = []
+        slot_lengths: List[int] = []
+        for observed_step in observed_steps:
+            # Strict no-future rule: slot at observed step t only sees actions before t.
+            action_seq = self._cumulative_actions_until_inclusive(traj, observed_step - 1)
+            # Frame-aligned cap: do not allow more GRU steps than frame transitions
+            # represented by this history image cutoff.
+            max_prefix_len = max(1, int(observed_step) - 1)
+            if len(action_seq) > max_prefix_len:
+                action_seq = action_seq[:max_prefix_len]
+            if len(action_seq) == 0:
+                prefix = actions_to_motion_features([STOP])
+            else:
+                prefix = actions_to_motion_features(action_seq)
+            slot_prefixes.append(prefix)
+            slot_lengths.append(int(prefix.size(0)))
+
+        max_t = max(slot_lengths) if slot_lengths else 1
+        padded_prefixes: List[torch.Tensor] = []
+        for prefix in slot_prefixes:
+            if prefix.size(0) < max_t:
+                pad = torch.zeros((max_t - prefix.size(0), prefix.size(1)), dtype=prefix.dtype)
+                prefix = torch.cat([prefix, pad], dim=0)
+            padded_prefixes.append(prefix)
+
+        return (
+            torch.stack(padded_prefixes, dim=0),
+            torch.tensor(slot_lengths, dtype=torch.long),
+            frame_ids,
+            observed_steps,
+        )
 
     @property
     def lengths(self):
@@ -431,8 +667,23 @@ class LazySupervisedDataset(Dataset):
             raise e
 
     def _get_item(self, sources) -> Dict[str, torch.Tensor]:
+        source_item = sources[0] if isinstance(sources, list) and len(sources) > 0 else {}
+        is_native = (
+            isinstance(source_item, dict)
+            and "conversations" not in source_item
+            and "q" in source_item
+            and "a" in source_item
+            and "frames" in source_item
+        )
+
+        preprocess_sources = sources
+        if is_native:
+            patched = dict(source_item)
+            patched["_gru_history_slots"] = self.gru_history_slots
+            preprocess_sources = [patched]
+
         data_dict = preprocess_qwen_visual(
-            sources,
+            preprocess_sources,
             self.processor,
         )
 
@@ -481,32 +732,49 @@ class LazySupervisedDataset(Dataset):
         ]
         label = self.processor.tokenizer.decode(labels, skip_special_tokens=False)
 
-        source_item = sources[0] if isinstance(sources, list) and len(sources) > 0 else {}
-        raw_actions = source_item.get("gru", [])
-        if not isinstance(raw_actions, list):
-            raw_actions = []
-        raw_actions = [int(a) for a in raw_actions if isinstance(a, (int, float))]
+        if is_native:
+            gru_features, gru_lengths, frame_ids, step_targets = self._runtime_native_gru_features(source_item)
+            data_dict["frame_ids"] = frame_ids
+            data_dict["frame_step_targets"] = step_targets
+        else:
+            raw_actions = source_item.get("gru", [])
+            if not isinstance(raw_actions, list):
+                raw_actions = []
+            raw_actions = [int(a) for a in raw_actions if isinstance(a, (int, float))]
 
-        min_seq_len = max(1, int(getattr(self.data_args, "gru_min_seq_len", 1)))
-        if len(raw_actions) < min_seq_len:
-            if getattr(self.data_args, "gru_fallback_to_stop", True):
-                raw_actions = [STOP] * min_seq_len
-            else:
-                raise ValueError(
-                    f"Sample has short GRU sequence len={len(raw_actions)} < {min_seq_len}"
-                )
+            min_seq_len = max(1, int(getattr(self.data_args, "gru_min_seq_len", 1)))
+            if len(raw_actions) < min_seq_len:
+                if getattr(self.data_args, "gru_fallback_to_stop", True):
+                    raw_actions = [STOP] * min_seq_len
+                else:
+                    raise ValueError(
+                        f"Sample has short GRU sequence len={len(raw_actions)} < {min_seq_len}"
+                    )
 
-        gru_features = actions_to_motion_features(raw_actions)
+            gru_features = actions_to_motion_features(raw_actions).unsqueeze(0)
+            gru_lengths = torch.tensor([int(gru_features.size(1))], dtype=torch.long)
+
         data_dict["gru_features"] = gru_features
-        data_dict["gru_length"] = torch.tensor(gru_features.size(0), dtype=torch.long)
+        data_dict["gru_lengths"] = gru_lengths
+        data_dict["gru_length"] = torch.tensor(int(gru_features.size(0)), dtype=torch.long)
+
+        # Motion-token diagnostics used by debug scripts and forward alignment checks.
+        motion_token_text = getattr(self.data_args, "motion_token_text", DEFAULT_MOTION_TOKEN)
+        motion_token_id = self.processor.tokenizer.convert_tokens_to_ids(motion_token_text)
+        if motion_token_id is None:
+            motion_token_id = -1
+        token_row = data_dict["input_ids"][0]
+        motion_positions = (token_row == motion_token_id).nonzero(as_tuple=False).squeeze(-1)
+        data_dict["motion_token_id"] = torch.tensor(int(motion_token_id), dtype=torch.long)
+        data_dict["motion_positions"] = motion_positions.to(dtype=torch.long)
+        data_dict["motion_token_count"] = torch.tensor(int(motion_positions.numel()), dtype=torch.long)
 
         return data_dict
 
     def _get_packed_item(self, sources) -> Dict[str, torch.Tensor]:
 
         if isinstance(sources, dict):
-            if isinstance(source, dict):
-                sources = [sources]
+            sources = [sources]
             assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
             return self._get_item(sources)
 
@@ -594,6 +862,31 @@ def pad_and_cat(tensor_list):
     return stacked_tensor
 
 
+def collate_gru_prefixes(instances: Sequence[Dict]) -> Tuple[torch.Tensor, torch.Tensor]:
+    gru_features = [instance["gru_features"] for instance in instances]
+    gru_lengths = [instance.get("gru_lengths") for instance in instances]
+
+    max_slots = max(int(feat.size(0)) for feat in gru_features)
+    max_t = max(int(feat.size(1)) for feat in gru_features)
+    feat_dim = int(gru_features[0].size(2))
+
+    feat_batch = torch.zeros(
+        (len(instances), max_slots, max_t, feat_dim),
+        dtype=gru_features[0].dtype,
+    )
+    len_batch = torch.zeros((len(instances), max_slots), dtype=torch.long)
+
+    for i, feat in enumerate(gru_features):
+        s, t, _ = feat.shape
+        feat_batch[i, :s, :t, :] = feat
+        gl = gru_lengths[i]
+        if gl is None:
+            gl = torch.full((s,), int(t), dtype=torch.long)
+        len_batch[i, :s] = gl[:s]
+
+    return feat_batch, len_batch
+
+
 @dataclass
 class DataCollatorForSupervisedDataset(object):
     """Collate examples for supervised fine-tuning."""
@@ -663,14 +956,18 @@ class DataCollatorForSupervisedDataset(object):
         batch["position_ids"] = position_ids
 
         if all("gru_features" in instance for instance in instances):
-            gru_features = [instance["gru_features"] for instance in instances]
-            gru_lengths = torch.tensor(
-                [int(instance["gru_length"]) for instance in instances], dtype=torch.long
+            feat_batch, len_batch = collate_gru_prefixes(instances)
+            batch["gru_features"] = feat_batch
+            batch["gru_lengths"] = len_batch
+
+        if all("motion_token_id" in instance for instance in instances):
+            batch["motion_token_id"] = int(instances[0]["motion_token_id"])
+        if all("motion_token_count" in instance for instance in instances):
+            batch["motion_token_count"] = torch.tensor(
+                [int(instance["motion_token_count"]) for instance in instances], dtype=torch.long
             )
-            batch["gru_features"] = torch.nn.utils.rnn.pad_sequence(
-                gru_features, batch_first=True, padding_value=0.0
-            )
-            batch["gru_lengths"] = gru_lengths
+        if all("motion_positions" in instance for instance in instances):
+            batch["motion_positions"] = [instance["motion_positions"].tolist() for instance in instances]
 
         return batch
 
@@ -747,14 +1044,18 @@ class FlattenedDataCollatorForSupervisedDataset(DataCollatorForSupervisedDataset
         batch["video_grid_thw"] = video_grid_thw
 
         if all("gru_features" in instance for instance in instances):
-            gru_features = [instance["gru_features"] for instance in instances]
-            gru_lengths = torch.tensor(
-                [int(instance["gru_length"]) for instance in instances], dtype=torch.long
+            feat_batch, len_batch = collate_gru_prefixes(instances)
+            batch["gru_features"] = feat_batch
+            batch["gru_lengths"] = len_batch
+
+        if all("motion_token_id" in instance for instance in instances):
+            batch["motion_token_id"] = int(instances[0]["motion_token_id"])
+        if all("motion_token_count" in instance for instance in instances):
+            batch["motion_token_count"] = torch.tensor(
+                [int(instance["motion_token_count"]) for instance in instances], dtype=torch.long
             )
-            batch["gru_features"] = torch.nn.utils.rnn.pad_sequence(
-                gru_features, batch_first=True, padding_value=0.0
-            )
-            batch["gru_lengths"] = gru_lengths
+        if all("motion_positions" in instance for instance in instances):
+            batch["motion_positions"] = [instance["motion_positions"].tolist() for instance in instances]
 
         return batch
 

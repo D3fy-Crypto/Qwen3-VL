@@ -96,6 +96,7 @@ def train(attn_implementation="flash_attention_2"):
     model = GRUSFTQwenModel(
         qwen_model_id=model_args.model_name_or_path,
         projector_k=training_args.projector_k,
+        motion_token_id=None,
         device=device,
         dtype=dtype,
         tune_qwen_vision=training_args.tune_qwen_vision,
@@ -126,6 +127,27 @@ def train(attn_implementation="flash_attention_2"):
         padding_side="right",
         use_fast=False,
     )
+
+    motion_token_text = getattr(data_args, "motion_token_text", "<motion>")
+    added_motion_tokens = 0
+    if tokenizer.convert_tokens_to_ids(motion_token_text) == tokenizer.unk_token_id:
+        added_motion_tokens = tokenizer.add_special_tokens(
+            {"additional_special_tokens": [motion_token_text]}
+        )
+    motion_token_id = tokenizer.convert_tokens_to_ids(motion_token_text)
+    if added_motion_tokens > 0:
+        model.qwen.resize_token_embeddings(len(tokenizer))
+        rank0_print(
+            f"[GRU-SFT] Added special motion token {motion_token_text} with id={motion_token_id}"
+        )
+    else:
+        rank0_print(
+            f"[GRU-SFT] Using existing motion token {motion_token_text} with id={motion_token_id}"
+        )
+    model.motion_token_id = int(motion_token_id)
+
+    if hasattr(processor, "tokenizer"):
+        processor.tokenizer = tokenizer
 
     # Gradient checkpointing — proxy through GRUSFTQwenModel to inner Qwen
     if training_args.gradient_checkpointing:

@@ -28,6 +28,7 @@ from .data_processor import (
 from .rope2d import get_rope_index_25, get_rope_index_2, get_rope_index_3
 
 local_rank = None
+DEFAULT_MOTION_TOKEN = "<motion>"
 
 
 def rank0_print(*args):
@@ -73,12 +74,19 @@ def _build_messages_gru_sft(item: Dict[str, Any], base_path: Path) -> List[Dict[
     )
     messages = [{"role": "system", "content": [{"type": "text", "text": system_prompt}]}]
 
+    raw_gru = item.get("gru", []) if isinstance(item, dict) else []
+    if not isinstance(raw_gru, list):
+        raw_gru = []
+    motion_len = max(1, len(raw_gru))
+    motion_prompt = " ".join([DEFAULT_MOTION_TOKEN] * min(motion_len, 64))
+
     # ScanQA / video format (no "frames" key)
     if "frames" not in item:
         video_path = str((base_path / f"{item['video_id']}.mp4").resolve())
         pil_frames = _extract_video_frames(video_path, NUM_HISTORICAL_FRAMES + 1)
         answer = random.choice(item["a"]) if isinstance(item["a"], list) else item["a"]
         content = [
+            {"type": "text", "text": f"Trajectory memory tokens: {motion_prompt}"},
             *[{"type": "image", "image": f} for f in pil_frames],
             {"type": "text", "text": item["q"]},
         ]
@@ -97,6 +105,7 @@ def _build_messages_gru_sft(item: Dict[str, Any], base_path: Path) -> List[Dict[
     historical = [historical_pool[i] for i in indices]
 
     content = [
+        {"type": "text", "text": f"Trajectory memory tokens: {motion_prompt}"},
         {"type": "text", "text": "Your trajectory history is encoded in your context. Historical observations:"},
         *[{"type": "image", "image": _make_abs_paths(base_path, f)} for f in historical],
         {"type": "text", "text": "Current observation:"},
@@ -211,6 +220,16 @@ class LazySupervisedDatasetGRUSFT(LazySupervisedDataset):
         data_dict["gru_features"] = gru_features   # [T, 4]
         data_dict["gru_lengths"] = gru_lengths      # scalar tensor
 
+        motion_token_text = getattr(self.data_args, "motion_token_text", DEFAULT_MOTION_TOKEN)
+        motion_token_id = self.processor.tokenizer.convert_tokens_to_ids(motion_token_text)
+        if motion_token_id is None:
+            motion_token_id = -1
+        token_row = data_dict["input_ids"][0]
+        motion_positions = (token_row == motion_token_id).nonzero(as_tuple=False).squeeze(-1)
+        data_dict["motion_token_id"] = torch.tensor(int(motion_token_id), dtype=torch.long)
+        data_dict["motion_positions"] = motion_positions.to(dtype=torch.long)
+        data_dict["motion_token_count"] = torch.tensor(int(motion_positions.numel()), dtype=torch.long)
+
         return data_dict
 
 
@@ -234,6 +253,15 @@ class DataCollatorForGRUSFT(DataCollatorForSupervisedDataset):
             gru_features, batch_first=True
         )  # [B, T_max, 4]
         batch["gru_lengths"] = torch.cat(gru_lengths)  # [B]
+
+        if all("motion_token_id" in inst for inst in instances):
+            batch["motion_token_id"] = int(instances[0]["motion_token_id"])
+        if all("motion_token_count" in inst for inst in instances):
+            batch["motion_token_count"] = torch.tensor(
+                [int(inst["motion_token_count"]) for inst in instances], dtype=torch.long
+            )
+        if all("motion_positions" in inst for inst in instances):
+            batch["motion_positions"] = [inst["motion_positions"].tolist() for inst in instances]
 
         return batch
 

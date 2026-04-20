@@ -8,3 +8,6 @@ __pycache__/
 *.pyo
 *.pyd
 **/wandb/*
+
+/qwen-vl-finetune/output_gru_qwen_smoke/*
+.gitignrore

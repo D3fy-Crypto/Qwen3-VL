@@ -46,6 +46,7 @@ class GRUQwenModel(nn.Module):
                  qwen_model_id: str,
                  gru_checkpoint_path: Optional[str] = None,
                  projector_k: int = 1,
+                 motion_token_id: Optional[int] = None,
                  device: str = "cuda",
                  dtype = None,
                  tune_qwen_vision: bool = False,
@@ -71,6 +72,7 @@ class GRUQwenModel(nn.Module):
         self.tune_qwen_vision = tune_qwen_vision
         self.tune_qwen_lm = tune_qwen_lm
         self.tune_projector = tune_projector
+        self.motion_token_id = motion_token_id
         
         # Load Qwen model first to derive hidden size.
         self._load_qwen_model(qwen_model_id, device, dtype)
@@ -196,8 +198,10 @@ class GRUQwenModel(nn.Module):
         Forward pass through GRU-Qwen model.
         
         Args:
-            gru_features: Trajectory features (batch_size, traj_seq_len, 7)
-            gru_lengths: Valid trajectory lengths (batch_size,)
+            gru_features: Trajectory features, either (batch_size, traj_seq_len, 7)
+                or per-slot prefixes (batch_size, num_slots, prefix_len, 7)
+            gru_lengths: Valid lengths matching gru_features shape, either (batch_size,)
+                or per-slot lengths (batch_size, num_slots)
             input_ids: Text token IDs (batch_size, text_seq_len)
             attention_mask: Attention mask for text tokens (batch_size, text_seq_len)
             pixel_values: Vision input (for multimodal Qwen models)
@@ -220,34 +224,73 @@ class GRUQwenModel(nn.Module):
             labels = labels.to(self.device)
         
         with torch.no_grad():
-            gru_hidden = self.trajectory_gru.encode_sequence(gru_features, gru_lengths)
+            if gru_features.dim() == 4:
+                bsz, num_slots, max_t, feat_dim = gru_features.shape
+                flat_features = gru_features.reshape(bsz * num_slots, max_t, feat_dim)
+                flat_lengths = gru_lengths.reshape(bsz * num_slots)
+                flat_lengths = flat_lengths.clamp(min=1, max=max_t)
 
-        projected = self.projector(gru_hidden)
-        
+                flat_hidden = self.trajectory_gru.encode_sequence(flat_features, flat_lengths)
+                flat_last_idx = (flat_lengths - 1).to(dtype=torch.long)
+                flat_last = flat_hidden[
+                    torch.arange(flat_hidden.shape[0], device=flat_hidden.device),
+                    flat_last_idx,
+                    :,
+                ]
+
+                projected = self.projector(flat_last).reshape(bsz, num_slots, -1)
+                gru_hidden = flat_hidden.reshape(bsz, num_slots, max_t, -1)
+            else:
+                gru_hidden = self.trajectory_gru.encode_sequence(gru_features, gru_lengths)
+                projected = self.projector(gru_hidden)
+
         if input_ids is not None:
             input_embeds = self.qwen.get_input_embeddings()(input_ids)
+            projected = projected.to(dtype=input_embeds.dtype, device=input_embeds.device)
         else:
             input_embeds = None
-        
+
+        labels_for_model = labels.clone() if labels is not None else None
+
         if input_embeds is not None:
-            combined_embeds = torch.cat([projected, input_embeds], dim=1)
-            
-            batch_size = projected.shape[0]
-            traj_attention = torch.ones(
-                batch_size, projected.shape[1],
-                device=self.device,
-                dtype=attention_mask.dtype if attention_mask is not None else torch.long
+            combined_embeds = input_embeds
+            combined_attention = attention_mask if attention_mask is not None else torch.ones(
+                input_embeds.shape[:2], device=self.device, dtype=torch.long
             )
-            
-            if attention_mask is not None:
-                combined_attention = torch.cat([traj_attention, attention_mask], dim=1)
-            else:
-                combined_attention = traj_attention
+
+            placement_stats = []
+            for b in range(combined_embeds.shape[0]):
+                if gru_lengths.dim() == 2:
+                    seq_len = int((gru_lengths[b] > 0).sum().item())
+                else:
+                    seq_len = int(gru_lengths[b].item())
+                seq_len = max(1, min(seq_len, projected.shape[1]))
+
+                if self.motion_token_id is not None and self.motion_token_id >= 0:
+                    motion_positions = (input_ids[b] == int(self.motion_token_id)).nonzero(as_tuple=False).squeeze(-1)
+                else:
+                    motion_positions = torch.empty(0, dtype=torch.long, device=input_ids.device)
+
+                if motion_positions.numel() == 0:
+                    valid_positions = (
+                        combined_attention[b].nonzero(as_tuple=False).squeeze(-1)
+                        if combined_attention is not None
+                        else torch.arange(combined_embeds.shape[1], device=combined_embeds.device)
+                    )
+                    motion_positions = valid_positions[:seq_len]
+
+                use_n = min(int(motion_positions.numel()), seq_len)
+                if use_n > 0:
+                    use_pos = motion_positions[:use_n]
+                    combined_embeds[b, use_pos, :] = projected[b, :use_n, :]
+                    if labels_for_model is not None:
+                        labels_for_model[b, use_pos] = -100
+
+                placement_stats.append((int(motion_positions.numel()), use_n, seq_len))
         else:
             combined_embeds = projected
             combined_attention = torch.ones(
-                projected.shape[0], projected.shape[1],
-                device=self.device, dtype=torch.long
+                projected.shape[:2], device=self.device, dtype=torch.long
             )
         
         model_kwargs = {
@@ -255,14 +298,8 @@ class GRUQwenModel(nn.Module):
             "attention_mask": combined_attention,
         }
         
-        if labels is not None:
-            prefix_labels = torch.full(
-                (labels.shape[0], projected.shape[1]),
-                -100,
-                dtype=labels.dtype,
-                device=labels.device,
-            )
-            model_kwargs["labels"] = torch.cat([prefix_labels, labels], dim=1)
+        if labels_for_model is not None:
+            model_kwargs["labels"] = labels_for_model
         
         if pixel_values is not None:
             model_kwargs["pixel_values"] = pixel_values
@@ -278,6 +315,11 @@ class GRUQwenModel(nn.Module):
                 f"[GRU-Qwen][debug] batch gru_features={tuple(gru_features.shape)} "
                 f"gru_hidden={tuple(gru_hidden.shape)} projected={tuple(projected.shape)}"
             )
+            if input_ids is not None:
+                print(f"[GRU-Qwen][debug] motion_token_id={self.motion_token_id}")
+                print(f"[GRU-Qwen][debug] placement_stats=(found,use,gru_len) {placement_stats}")
+                print(f"[GRU-Qwen][debug] input_ids shape={tuple(input_ids.shape)}")
+                print(f"[GRU-Qwen][debug] combined_embeds shape={tuple(combined_embeds.shape)}")
         
         outputs = self.qwen(**model_kwargs)
 
