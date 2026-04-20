@@ -24,6 +24,7 @@ IMAGE_TOKEN_INDEX = 151655
 VIDEO_TOKEN_INDEX = 151656
 DEFAULT_IMAGE_TOKEN = "<image>"
 DEFAULT_VIDEO_TOKEN = "<video>"
+DEFAULT_MOTION_TOKEN = "<motion>"
 
 STOP = 0
 FORWARD = 1
@@ -186,6 +187,38 @@ def update_processor_pixels(processor, data_args):
 
 
 def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any]]:
+    # Native R2R/RxR annotation schema: {video_id, q, a, frames, ...}
+    if "conversations" not in item and "q" in item and "a" in item and "frames" in item:
+        frames = item.get("frames") or []
+        if isinstance(frames, str):
+            frames = [frames]
+        if len(frames) == 0:
+            raise ValueError("Sample has no frames")
+
+        historical_pool = frames[:-1] if len(frames) > 1 else [frames[0]]
+        num_hist = min(7, len(historical_pool))
+        hist_indices = np.linspace(0, len(historical_pool) - 1, num=num_hist, dtype=int).tolist()
+        historical = [historical_pool[i] for i in hist_indices]
+        current = frames[-1]
+
+        raw_gru = item.get("gru", []) if isinstance(item, dict) else []
+        if not isinstance(raw_gru, list):
+            raw_gru = []
+        motion_prompt = " ".join([DEFAULT_MOTION_TOKEN] * min(max(1, len(raw_gru)), 64))
+
+        user_content = [
+            {"type": "text", "text": f"Trajectory memory tokens: {motion_prompt}"},
+            {"type": "text", "text": "Historical observations:"},
+            *[{"type": "image", "image": _make_abs_paths(base_path, f)} for f in historical],
+            {"type": "text", "text": "Current observation:"},
+            {"type": "image", "image": _make_abs_paths(base_path, current)},
+            {"type": "text", "text": str(item.get("q", ""))},
+        ]
+        return [
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": [{"type": "text", "text": str(item.get("a", ""))}]},
+        ]
+
     # Extract and normalize images and videos
     images = item.get("image") or []
     if isinstance(images, str):
@@ -206,12 +239,17 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any
     messages = []
     for turn in item["conversations"]:
         role = "user" if turn["from"] == "human" else "assistant"
-        text: str = turn["value"]
+        text: str = str(turn["value"])
 
         if role == "user":
+            # Normalize legacy placeholders and ensure at least one motion anchor is present.
+            text = text.replace("<gru>", DEFAULT_MOTION_TOKEN)
+            if DEFAULT_MOTION_TOKEN not in text:
+                text = f"{DEFAULT_MOTION_TOKEN}\n{text}"
+
             content = []
-            # Split text by <image> or <video> placeholders while keeping delimiters
-            text_parts = re.split(r"(<image>|<video>)", text)
+            # Split text by multimodal placeholders while keeping delimiters.
+            text_parts = re.split(r"(<image>|<video>|<motion>)", text)
 
             for seg in text_parts:
                 if seg == "<image>":
@@ -232,6 +270,9 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any
                             content.append({"type": "text", "text": "[missing_video]"})
                     else:
                         content.append({"type": "text", "text": "[missing_video]"})
+                elif seg == DEFAULT_MOTION_TOKEN:
+                    # Keep <motion> in user text so tokenizer emits a stable motion placeholder token.
+                    content.append({"type": "text", "text": DEFAULT_MOTION_TOKEN})
                 elif seg.strip():
                     content.append({"type": "text", "text": seg.strip()})
 
@@ -500,13 +541,23 @@ class LazySupervisedDataset(Dataset):
         data_dict["gru_features"] = gru_features
         data_dict["gru_length"] = torch.tensor(gru_features.size(0), dtype=torch.long)
 
+        # Motion-token diagnostics used by debug scripts and forward alignment checks.
+        motion_token_text = getattr(self.data_args, "motion_token_text", DEFAULT_MOTION_TOKEN)
+        motion_token_id = self.processor.tokenizer.convert_tokens_to_ids(motion_token_text)
+        if motion_token_id is None:
+            motion_token_id = -1
+        token_row = data_dict["input_ids"][0]
+        motion_positions = (token_row == motion_token_id).nonzero(as_tuple=False).squeeze(-1)
+        data_dict["motion_token_id"] = torch.tensor(int(motion_token_id), dtype=torch.long)
+        data_dict["motion_positions"] = motion_positions.to(dtype=torch.long)
+        data_dict["motion_token_count"] = torch.tensor(int(motion_positions.numel()), dtype=torch.long)
+
         return data_dict
 
     def _get_packed_item(self, sources) -> Dict[str, torch.Tensor]:
 
         if isinstance(sources, dict):
-            if isinstance(source, dict):
-                sources = [sources]
+            sources = [sources]
             assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
             return self._get_item(sources)
 
@@ -672,6 +723,15 @@ class DataCollatorForSupervisedDataset(object):
             )
             batch["gru_lengths"] = gru_lengths
 
+        if all("motion_token_id" in instance for instance in instances):
+            batch["motion_token_id"] = int(instances[0]["motion_token_id"])
+        if all("motion_token_count" in instance for instance in instances):
+            batch["motion_token_count"] = torch.tensor(
+                [int(instance["motion_token_count"]) for instance in instances], dtype=torch.long
+            )
+        if all("motion_positions" in instance for instance in instances):
+            batch["motion_positions"] = [instance["motion_positions"].tolist() for instance in instances]
+
         return batch
 
 
@@ -755,6 +815,15 @@ class FlattenedDataCollatorForSupervisedDataset(DataCollatorForSupervisedDataset
                 gru_features, batch_first=True, padding_value=0.0
             )
             batch["gru_lengths"] = gru_lengths
+
+        if all("motion_token_id" in instance for instance in instances):
+            batch["motion_token_id"] = int(instances[0]["motion_token_id"])
+        if all("motion_token_count" in instance for instance in instances):
+            batch["motion_token_count"] = torch.tensor(
+                [int(instance["motion_token_count"]) for instance in instances], dtype=torch.long
+            )
+        if all("motion_positions" in instance for instance in instances):
+            batch["motion_positions"] = [instance["motion_positions"].tolist() for instance in instances]
 
         return batch
 

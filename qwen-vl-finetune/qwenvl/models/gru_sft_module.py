@@ -45,6 +45,7 @@ class GRUSFTQwenModel(nn.Module):
         self,
         qwen_model_id: str,
         projector_k: int = 1,
+        motion_token_id: Optional[int] = None,
         device: str = "cuda",
         dtype=None,
         tune_qwen_vision: bool = False,
@@ -55,6 +56,7 @@ class GRUSFTQwenModel(nn.Module):
 
         self.device_str = device
         self._debug_once = False
+        self.motion_token_id = motion_token_id
 
         # Load Qwen model
         self._load_qwen_model(qwen_model_id, device, dtype)
@@ -211,26 +213,48 @@ class GRUSFTQwenModel(nn.Module):
         # Get text (+ vision token) embeddings
         if input_ids is not None:
             input_embeds = self.qwen.get_input_embeddings()(input_ids)
+            projected = projected.to(dtype=input_embeds.dtype, device=input_embeds.device)
         else:
             input_embeds = None
 
+        labels_for_model = labels.clone() if labels is not None else None
+
         if input_embeds is not None:
-            combined_embeds = torch.cat([projected, input_embeds], dim=1)
-            B = projected.shape[0]
-            gru_attn = torch.ones(
-                B, projected.shape[1],
-                device=dev,
-                dtype=attention_mask.dtype if attention_mask is not None else torch.long,
+            combined_embeds = input_embeds
+            combined_attention = attention_mask if attention_mask is not None else torch.ones(
+                input_embeds.shape[:2], device=dev, dtype=torch.long
             )
-            combined_attention = (
-                torch.cat([gru_attn, attention_mask], dim=1)
-                if attention_mask is not None
-                else gru_attn
-            )
+
+            placement_stats = []
+            for b in range(combined_embeds.shape[0]):
+                seq_len = int(gru_lengths[b].item())
+                seq_len = max(1, min(seq_len, projected.shape[1]))
+
+                if self.motion_token_id is not None and self.motion_token_id >= 0 and input_ids is not None:
+                    motion_positions = (input_ids[b] == int(self.motion_token_id)).nonzero(as_tuple=False).squeeze(-1)
+                else:
+                    motion_positions = torch.empty(0, dtype=torch.long, device=combined_embeds.device)
+
+                if motion_positions.numel() == 0:
+                    valid_positions = (
+                        combined_attention[b].nonzero(as_tuple=False).squeeze(-1)
+                        if combined_attention is not None
+                        else torch.arange(combined_embeds.shape[1], device=combined_embeds.device)
+                    )
+                    motion_positions = valid_positions[:seq_len]
+
+                use_n = min(int(motion_positions.numel()), seq_len)
+                if use_n > 0:
+                    use_pos = motion_positions[:use_n]
+                    combined_embeds[b, use_pos, :] = projected[b, :use_n, :]
+                    if labels_for_model is not None:
+                        labels_for_model[b, use_pos] = -100
+
+                placement_stats.append((int(motion_positions.numel()), use_n, seq_len))
         else:
             combined_embeds = projected
             combined_attention = torch.ones(
-                projected.shape[0], projected.shape[1], device=dev, dtype=torch.long
+                projected.shape[:2], device=dev, dtype=torch.long
             )
 
         model_kwargs: Dict = {
@@ -238,12 +262,8 @@ class GRUSFTQwenModel(nn.Module):
             "attention_mask": combined_attention,
         }
 
-        if labels is not None:
-            prefix_ignore = torch.full(
-                (labels.shape[0], projected.shape[1]), -100,
-                dtype=labels.dtype, device=labels.device,
-            )
-            model_kwargs["labels"] = torch.cat([prefix_ignore, labels], dim=1)
+        if labels_for_model is not None:
+            model_kwargs["labels"] = labels_for_model
 
         if pixel_values is not None:
             model_kwargs["pixel_values"] = pixel_values.to(dev)
@@ -259,6 +279,9 @@ class GRUSFTQwenModel(nn.Module):
                 f"[GRU-SFT][debug] gru_features={tuple(gru_features.shape)} "
                 f"projected={tuple(projected.shape)} combined={tuple(combined_embeds.shape)}"
             )
+            if input_ids is not None:
+                print(f"[GRU-SFT][debug] motion_token_id={self.motion_token_id}")
+                print(f"[GRU-SFT][debug] placement_stats=(found,use,gru_len) {placement_stats}")
 
         outputs = self.qwen(**model_kwargs)
 

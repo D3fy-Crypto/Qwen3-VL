@@ -116,6 +116,28 @@ def train(attn_implementation="flash_attention_2"):
         use_fast=False,
     )
 
+    motion_token_text = getattr(data_args, "motion_token_text", "<motion>")
+    added_motion_tokens = 0
+    if tokenizer.convert_tokens_to_ids(motion_token_text) == tokenizer.unk_token_id:
+        added_motion_tokens = tokenizer.add_special_tokens(
+            {"additional_special_tokens": [motion_token_text]}
+        )
+    motion_token_id = tokenizer.convert_tokens_to_ids(motion_token_text)
+    if added_motion_tokens > 0:
+        model.qwen.resize_token_embeddings(len(tokenizer))
+        rank0_print(
+            f"[GRU-Qwen] Added special motion token {motion_token_text} with id={motion_token_id}"
+        )
+    else:
+        rank0_print(
+            f"[GRU-Qwen] Using existing motion token {motion_token_text} with id={motion_token_id}"
+        )
+    model.motion_token_id = int(motion_token_id)
+
+    # Ensure dataset tokenization uses the same tokenizer instance (with motion token added).
+    if hasattr(processor, "tokenizer"):
+        processor.tokenizer = tokenizer
+
     # Enable gradient checkpointing if requested
     if training_args.gradient_checkpointing:
         if hasattr(model.qwen, "enable_input_require_grads"):

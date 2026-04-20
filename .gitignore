@@ -7,3 +7,6 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+/qwen-vl-finetune/output_gru_qwen_smoke/*
+.gitignrore
