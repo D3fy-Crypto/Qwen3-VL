@@ -145,6 +145,16 @@ def select_frame_slots(frames: Sequence[str], slots: int = 8) -> List[Tuple[int,
     return [(int(i), frames[int(i)]) for i in indices]
 
 
+def _extract_frame_index(frame_rel: str) -> Optional[int]:
+    match = re.search(r"frame_(\d+)\.(?:jpg|jpeg|png|webp)$", str(frame_rel), re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"frame_(\d+)$", str(frame_rel), re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    return None
+
+
 def update_processor_pixels(processor, data_args):
     logger = logging.getLogger(__name__)
 
@@ -535,24 +545,28 @@ class LazySupervisedDataset(Dataset):
         selected = select_frame_slots(frames, slots=slots)
         frame_ids = [frame_rel for _, frame_rel in selected]
 
-        traj, cur_step = split_video_id(str(source_item.get("video_id", "")))
-        frame_count = max(1, len(frames))
+        traj, _ = split_video_id(str(source_item.get("video_id", "")))
 
-        # Map each selected frame index to the observed trajectory step for this sample.
-        # This keeps frame-slot semantics consistent and avoids slot-only interpolation drift.
-        if frame_count <= 1:
-            observed_steps = [max(0, cur_step)]
-        else:
-            observed_steps = [
-                int(round(frame_idx * max(0, cur_step) / (frame_count - 1)))
-                for frame_idx, _ in selected
-            ]
+        # Use the actual frame number for the cutoff rather than an interpolated slot anchor.
+        # This keeps "History N -> frame_k" aligned with the real prefix available at frame k,
+        # while still clamping to the observed trajectory length.
+        observed_steps: List[int] = []
+        for fallback_idx, frame_rel in selected:
+            frame_idx = _extract_frame_index(frame_rel)
+            if frame_idx is None:
+                frame_idx = int(fallback_idx)
+            observed_steps.append(max(0, int(frame_idx)))
 
         slot_prefixes: List[torch.Tensor] = []
         slot_lengths: List[int] = []
         for observed_step in observed_steps:
             # Strict no-future rule: slot at observed step t only sees actions before t.
             action_seq = self._cumulative_actions_until_inclusive(traj, observed_step - 1)
+            # Frame-aligned cap: do not allow more GRU steps than frame transitions
+            # represented by this history image cutoff.
+            max_prefix_len = max(1, int(observed_step) - 1)
+            if len(action_seq) > max_prefix_len:
+                action_seq = action_seq[:max_prefix_len]
             if len(action_seq) == 0:
                 prefix = actions_to_motion_features([STOP])
             else:

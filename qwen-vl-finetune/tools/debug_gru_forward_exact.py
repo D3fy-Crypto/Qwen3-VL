@@ -79,6 +79,15 @@ def build_raw_prompt(args, processor):
     if isinstance(source, list):
         source = source[0]
 
+    frame_step_targets = None
+    try:
+        sample = dataset[0]
+        frame_step_targets = sample.get("frame_step_targets")
+        if torch.is_tensor(frame_step_targets):
+            frame_step_targets = frame_step_targets.tolist()
+    except Exception:
+        frame_step_targets = None
+
     base_path = Path(source.get("data_path", ""))
     messages = _build_messages(source, base_path)
     raw_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
@@ -86,6 +95,7 @@ def build_raw_prompt(args, processor):
         "source": source,
         "messages": messages,
         "raw_prompt": raw_prompt,
+        "frame_step_targets": frame_step_targets,
     }
 
 
@@ -460,6 +470,7 @@ def main():
     print(f"gru_hidden_shape: {tuple(gru_diag['gru_hidden_shape'])}")
     print(f"projected_shape: {tuple(gru_diag['projected_shape'])}")
     print(f"motion_output_per_slot_shapes_0: {gru_diag['motion_output_per_slot_shape_0']}")
+    print(f"frame_step_targets_0: {raw_debug.get('frame_step_targets')}")
 
     print("raw_prompt_0:")
     print(raw_debug["raw_prompt"])
@@ -473,6 +484,7 @@ def main():
             "raw_source_0": raw_debug["source"],
             "raw_messages_0": raw_debug["messages"],
             "raw_prompt_0": raw_debug["raw_prompt"],
+            "frame_step_targets_0": raw_debug.get("frame_step_targets"),
             "input_ids_0": ids0,
             "motion_positions_0": motion_positions,
             "gru_lengths": batch["gru_lengths"].tolist(),

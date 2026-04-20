@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>GRU Motion Pipeline Visualizer</title>
+<style>
+:root {
+  --bg:#f7f6f2;
+  --ink:#1f2937;
+  --muted:#6b7280;
+  --card:#ffffff;
+  --line:#e5e7eb;
+  --brand:#0f766e;
+  --brand2:#f59e0b;
+  --brand3:#3b82f6;
+}
+* { box-sizing:border-box; }
+body { margin:0; font-family:'IBM Plex Sans', 'Segoe UI', sans-serif; color:var(--ink); background:radial-gradient(circle at 8% 0%, #fff5db 0, transparent 35%), radial-gradient(circle at 90% 10%, #dff7f2 0, transparent 32%), var(--bg); }
+.wrap { max-width:1280px; margin:0 auto; padding:24px; }
+.hero { background:linear-gradient(130deg, #0f766e 0%, #115e59 60%, #134e4a 100%); color:#ecfeff; border-radius:18px; padding:24px; box-shadow:0 20px 45px rgba(0,0,0,0.18); }
+.hero h1 { margin:0 0 10px; font-size:30px; }
+.hero .meta { display:flex; flex-wrap:wrap; gap:10px; }
+.chip { border:1px solid rgba(236,254,255,.35); border-radius:999px; padding:6px 12px; font-size:13px; }
+.grid { display:grid; grid-template-columns:repeat(12,1fr); gap:14px; margin-top:16px; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:16px; box-shadow:0 8px 20px rgba(0,0,0,0.06); }
+.c12 { grid-column:span 12; }
+.c8 { grid-column:span 8; }
+.c6 { grid-column:span 6; }
+.c4 { grid-column:span 4; }
+h2 { margin:0 0 10px; font-size:18px; }
+small, .muted { color:var(--muted); }
+.pipeline { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:10px; align-items:stretch; }
+.stage { border:1px dashed var(--line); border-radius:12px; padding:10px; background:#fafafa; }
+.stage h3 { margin:0 0 6px; font-size:14px; color:#111827; }
+.stage p { margin:0; font-size:12px; color:var(--muted); }
+.table { width:100%; border-collapse:collapse; font-size:13px; }
+.table th,.table td { border-bottom:1px solid var(--line); padding:8px; text-align:left; vertical-align:top; }
+.table th { background:#f8fafc; position:sticky; top:0; }
+pre { margin:0; background:#0b1020; color:#dbeafe; border-radius:12px; padding:12px; overflow:auto; max-height:280px; font-size:12px; }
+code { background:#f8fafc; border:1px solid var(--line); border-radius:8px; padding:4px 6px; font-size:12px; display:block; white-space:pre-wrap; word-break:break-word; }
+.kpi { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; }
+.k { background:#f9fafb; border:1px solid var(--line); border-radius:12px; padding:10px; }
+.k .v { font-weight:700; margin-top:6px; }
+.barrow { display:grid; grid-template-columns:40px 1fr 50px; gap:10px; align-items:center; margin-bottom:8px; }
+.bar { height:10px; border-radius:999px; background:#e5e7eb; overflow:hidden; }
+.fill { height:100%; background:linear-gradient(90deg, var(--brand3), var(--brand)); }
+.msgcard { border:1px solid var(--line); border-radius:12px; margin-bottom:10px; overflow:hidden; }
+.msghead { background:#f8fafc; font-weight:600; padding:8px 10px; font-size:13px; }
+.msgtext,.msgimg { padding:8px 10px; border-top:1px solid var(--line); font-size:13px; line-height:1.45; }
+.msgimg { color:#334155; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+@media (max-width:980px) {
+  .c8,.c6,.c4 { grid-column:span 12; }
+  .kpi { grid-template-columns:repeat(2,1fr); }
+  .pipeline { grid-template-columns:1fr; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <section class="hero">
+    <h1>GRU -> Motion Token -> LLM Pipeline Visualizer</h1>
+    <div class="meta">
+      <span class="chip">video_id: 914-23</span>
+      <span class="chip">motion_token_id: 151669</span>
+      <span class="chip">loss: 1.0065104961395264</span>
+      <span class="chip">annotation_db: /home/rithvik/IROS_proj/NaVILA-Dataset/R2R/annotations.json</span>
+    </div>
+  </section>
+
+  <div class="grid">
+    <section class="card c12">
+      <h2>End-to-End Flow</h2>
+      <div class="pipeline">
+        <div class="stage"><h3>1) Annotation DB</h3><p>Read trajectory actions from annotations.json grouped by video_id step.</p></div>
+        <div class="stage"><h3>2) Frame Slots</h3><p>Select 8 frames and compute per-slot frame cutoffs.</p></div>
+        <div class="stage"><h3>3) GRU Prefix Build</h3><p>Build prefix action sequence per slot and convert to 7D motion features.</p></div>
+        <div class="stage"><h3>4) GRU + Projector</h3><p>Encode with GRU, pick valid slot output, project to 4096D motion token embeddings.</p></div>
+        <div class="stage"><h3>5) LLM Fusion</h3><p>Insert projected motion tokens at &lt;motion&gt; positions in prompt embeddings.</p></div>
+      </div>
+    </section>
+
+    <section class="card c12">
+      <h2>Shapes and Token Placement</h2>
+      <div class="kpi">
+        <div class="k"><small>gru_input_shape</small><div class="v">[1, 8, 47, 7]</div></div>
+        <div class="k"><small>gru_hidden_shape</small><div class="v">[1, 8, 47, 256]</div></div>
+        <div class="k"><small>projected_shape</small><div class="v">[1, 8, 4096]</div></div>
+        <div class="k"><small>logits_shape</small><div class="v">[1, 2402, 151670]</div></div>
+      </div>
+      <div style="margin-top:10px;"><small>motion_positions_0: [60, 341, 623, 905, 1187, 1469, 1751, 2032]</small></div>
+    </section>
+
+    <section class="card c6">
+      <h2>Action Set Extracted From DB</h2>
+      <small>Parsed from answers in annotations for this trajectory.</small>
+      <table class="table">
+        <thead><tr><th>Step</th><th>Answer</th><th>Action Codes</th><th>Len</th></tr></thead>
+        <tbody><tr><td>0</td><td>The next action is turn left 45 degree.</td><td>[2, 2, 2]</td><td>3</td></tr>
+<tr><td>0</td><td>The next action is turn left 45 degree.</td><td>[2, 2, 2]</td><td>3</td></tr>
+<tr><td>1</td><td>The next action is turn left 45 degree.</td><td>[2, 2, 2]</td><td>3</td></tr>
+<tr><td>1</td><td>The next action is turn left 45 degree.</td><td>[2, 2, 2]</td><td>3</td></tr>
+<tr><td>2</td><td>The next action is turn left 45 degree.</td><td>[2, 2, 2]</td><td>3</td></tr>
+<tr><td>2</td><td>The next action is turn left 45 degree.</td><td>[2, 2, 2]</td><td>3</td></tr>
+<tr><td>3</td><td>The next action is turn left 45 degree.</td><td>[2, 2, 2]</td><td>3</td></tr>
+<tr><td>3</td><td>The next action is turn left 45 degree.</td><td>[2, 2, 2]</td><td>3</td></tr>
+<tr><td>4</td><td>The next action is move forward 75 cm.</td><td>[1, 1, 1]</td><td>3</td></tr>
+<tr><td>5</td><td>The next action is move forward 25 cm.</td><td>[1]</td><td>1</td></tr>
+<tr><td>6</td><td>The next action is turn left 45 degree.</td><td>[2, 2, 2]</td><td>3</td></tr>
+<tr><td>6</td><td>The next action is turn left 45 degree.</td><td>[2, 2, 2]</td><td>3</td></tr>
+<tr><td>7</td><td>The next action is turn left 15 degree.</td><td>[2]</td><td>1</td></tr>
+<tr><td>8</td><td>The next action is move forward 25 cm.</td><td>[1]</td><td>1</td></tr>
+<tr><td>9</td><td>The next action is turn left 15 degree.</td><td>[2]</td><td>1</td></tr>
+<tr><td>10</td><td>The next action is move forward 75 cm.</td><td>[1, 1, 1]</td><td>3</td></tr>
+<tr><td>11</td><td>The next action is move forward 50 cm.</td><td>[1, 1]</td><td>2</td></tr>
+<tr><td>12</td><td>The next action is turn left 15 degree.</td><td>[2]</td><td>1</td></tr>
+<tr><td>13</td><td>The next action is move forward 75 cm.</td><td>[1, 1, 1]</td><td>3</td></tr>
+<tr><td>14</td><td>The next action is move forward 25 cm.</td><td>[1]</td><td>1</td></tr>
+<tr><td>15</td><td>The next action is turn left 45 degree.</td><td>[2, 2, 2]</td><td>3</td></tr>
+<tr><td>15</td><td>The next action is turn left 45 degree.</td><td>[2, 2, 2]</td><td>3</td></tr>
+<tr><td>16</td><td>The next action is turn left 15 degree.</td><td>[2]</td><td>1</td></tr>
+<tr><td>17</td><td>The next action is move forward 25 cm.</td><td>[1]</td><td>1</td></tr>
+<tr><td>18</td><td>The next action is turn left 15 degree.</td><td>[2]</td><td>1</td></tr>
+<tr><td>19</td><td>The next action is move forward 75 cm.</td><td>[1, 1, 1]</td><td>3</td></tr>
+<tr><td>20</td><td>The next action is move forward 75 cm.</td><td>[1, 1, 1]</td><td>3</td></tr>
+<tr><td>21</td><td>The next action is turn left 15 degree.</td><td>[2]</td><td>1</td></tr>
+<tr><td>22</td><td>The next action is move forward 75 cm.</td><td>[1, 1, 1]</td><td>3</td></tr>
+<tr><td>23</td><td>The next action is move forward 75 cm.</td><td>[1, 1, 1]</td><td>3</td></tr>
+<tr><td>24</td><td>The next action is turn right 45 degree.</td><td>[3, 3, 3]</td><td>3</td></tr>
+<tr><td>24</td><td>The next action is turn right 45 degree.</td><td>[3, 3, 3]</td><td>3</td></tr>
+<tr><td>25</td><td>The next action is turn right 30 degree.</td><td>[3, 3]</td><td>2</td></tr>
+<tr><td>25</td><td>The next action is turn right 30 degree.</td><td>[3, 3]</td><td>2</td></tr>
+<tr><td>26</td><td>The next action is move forward 75 cm.</td><td>[1, 1, 1]</td><td>3</td></tr>
+<tr><td>27</td><td>The next action is turn right 15 degree.</td><td>[3]</td><td>1</td></tr>
+<tr><td>28</td><td>The next action is move forward 75 cm.</td><td>[1, 1, 1]</td><td>3</td></tr>
+<tr><td>29</td><td>The next action is move forward 75 cm.</td><td>[1, 1, 1]</td><td>3</td></tr>
+<tr><td>30</td><td>The next action is move forward 50 cm.</td><td>[1, 1]</td><td>2</td></tr>
+<tr><td>31</td><td>The next action is turn left 15 degree.</td><td>[2]</td><td>1</td></tr>
+<tr><td>32</td><td>The next action is move forward 75 cm.</td><td>[1, 1, 1]</td><td>3</td></tr>
+<tr><td>33</td><td>The next action is turn left 30 degree.</td><td>[2, 2]</td><td>2</td></tr>
+<tr><td>33</td><td>The next action is turn left 30 degree.</td><td>[2, 2]</td><td>2</td></tr>
+<tr><td>34</td><td>The next action is move forward 50 cm.</td><td>[1, 1]</td><td>2</td></tr>
+<tr><td>35</td><td>The next action is turn left 15 degree.</td><td>[2]</td><td>1</td></tr>
+<tr><td>36</td><td>The next action is move forward 25 cm.</td><td>[1]</td><td>1</td></tr>
+<tr><td>37</td><td>The next action is turn right 15 degree.</td><td>[3]</td><td>1</td></tr>
+<tr><td>38</td><td>The next action is move forward 75 cm.</td><td>[1, 1, 1]</td><td>3</td></tr>
+<tr><td>39</td><td>I think I should stop because I have finished the instruction.</td><td>[0]</td><td>1</td></tr>
+<tr><td>39</td><td>I think I should stop because I have finished the instruction.</td><td>[0]</td><td>1</td></tr>
+<tr><td>39</td><td>I think I should stop because I have finished the instruction.</td><td>[0]</td><td>1</td></tr></tbody>
+      </table>
+    </section>
+
+        <section class="card c12">
+            <h2>GRU Input And Motion Token Output (Per 8 Slots)</h2>
+            <small>GRU input vectors are truncated to first 3 steps + last step and rounded to 3 decimals. Motion token output shows first 12 dims of 4096.</small>
+            <table class="table">
+                <thead><tr><th>Slot</th><th>GRU Len</th><th>GRU Input (7D vectors)</th><th>Projected Motion Token (4096D preview)</th></tr></thead>
+                <tbody><tr><td>H1</td><td>1</td><td><code>[[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]</code></td><td><code>[0.0213, -0.0172, 0.0242, 0.005, -0.0214, 0.0007, 0.0359, 0.0102, 0.022, 0.0045, -0.0092, -0.0011, "..."]</code></td></tr>
+<tr><td>H2</td><td>5</td><td><code>[[0.0, 0.0, 0.259, 0.966, 0.262, 0.0, 1.0], [0.0, 0.0, 0.5, 0.866, 0.262, 0.0, 1.0], [0.0, 0.0, 0.707, 0.707, 0.262, 0.0, 1.0], [0.0, 0.0, 0.966, 0.259, 0.262, 0.0, 1.0], "...", [last step]]</code></td><td><code>[0.0184, -0.0004, 0.0209, 0.0104, -0.0245, 0.0079, 0.0491, -0.0059, 0.0235, 0.0033, -0.0031, 0.0009, "..."]</code></td></tr>
+<tr><td>H3</td><td>12</td><td><code>[[0.0, 0.0, 0.259, 0.966, 0.262, 0.0, 1.0], [0.0, 0.0, 0.5, 0.866, 0.262, 0.0, 1.0], [0.0, 0.0, 0.707, 0.707, 0.262, 0.0, 1.0], [0.0, 0.0, -0.0, -1.0, 0.262, 0.0, 1.0], "...", [last step]]</code></td><td><code>[0.0187, -0.0087, 0.0122, -0.0084, -0.0347, -0.0036, 0.0595, -0.0237, 0.0034, 0.0064, 0.0043, -0.0018, "..."]</code></td></tr>
+<tr><td>H4</td><td>19</td><td><code>[[0.0, 0.0, 0.259, 0.966, 0.262, 0.0, 1.0], [0.0, 0.0, 0.5, 0.866, 0.262, 0.0, 1.0], [0.0, 0.0, 0.707, 0.707, 0.262, 0.0, 1.0], [-1.0, -0.0, -0.707, -0.707, 0.262, 0.0, 1.0], "...", [last step]]</code></td><td><code>[0.0298, -0.02, 0.0132, -0.022, -0.0319, -0.0064, 0.0649, -0.0197, -0.0103, 0.008, 0.005, -0.0017, "..."]</code></td></tr>
+<tr><td>H5</td><td>26</td><td><code>[[0.0, 0.0, 0.259, 0.966, 0.262, 0.0, 1.0], [0.0, 0.0, 0.5, 0.866, 0.262, 0.0, 1.0], [0.0, 0.0, 0.707, 0.707, 0.262, 0.0, 1.0], [-1.384, -1.182, -0.966, -0.259, 0.0, 1.0, 0.0], "...", [last step]]</code></td><td><code>[0.0397, -0.0299, 0.012, -0.0213, -0.0327, -0.0172, 0.0524, 0.003, -0.014, -0.0025, 0.0007, -0.0157, "..."]</code></td></tr>
+<tr><td>H6</td><td>33</td><td><code>[[0.0, 0.0, 0.259, 0.966, 0.262, 0.0, 1.0], [0.0, 0.0, 0.5, 0.866, 0.262, 0.0, 1.0], [0.0, 0.0, 0.707, 0.707, 0.262, 0.0, 1.0], [-1.449, -2.424, -0.966, 0.259, 0.262, 0.0, 1.0], "...", [last step]]</code></td><td><code>[0.0381, -0.0072, 0.0009, -0.0103, -0.0499, -0.027, 0.0606, 0.0192, 0.0002, -0.0015, 0.0005, -0.0237, "..."]</code></td></tr>
+<tr><td>H7</td><td>40</td><td><code>[[0.0, 0.0, 0.259, 0.966, 0.262, 0.0, 1.0], [0.0, 0.0, 0.5, 0.866, 0.262, 0.0, 1.0], [0.0, 0.0, 0.707, 0.707, 0.262, 0.0, 1.0], [-0.749, -2.678, -0.259, 0.966, 0.0, 1.0, 0.0], "...", [last step]]</code></td><td><code>[0.0372, 0.0001, 0.0039, 0.0054, -0.0457, -0.0212, 0.045, 0.0317, 0.0148, -0.0093, -0.006, -0.0273, "..."]</code></td></tr>
+<tr><td>H8</td><td>47</td><td><code>[[0.0, 0.0, 0.259, 0.966, 0.262, 0.0, 1.0], [0.0, 0.0, 0.5, 0.866, 0.262, 0.0, 1.0], [0.0, 0.0, 0.707, 0.707, 0.262, 0.0, 1.0], [0.717, -2.937, -0.0, 1.0, 0.0, 1.0, 0.0], "...", [last step]]</code></td><td><code>[0.0233, 0.0061, -0.0025, 0.0302, -0.0434, -0.0277, 0.0331, 0.0319, 0.0332, -0.0094, -0.0041, -0.027, "..."]</code></td></tr></tbody>
+            </table>
+        </section>
+
+    <section class="card c6">
+      <h2>Slot -> Frame -> GRU Input Mapping</h2>
+      <small>What each History slot actually feeds into GRU.</small>
+      <table class="table">
+        <thead><tr><th>Slot</th><th>Frame</th><th>Frame Idx</th><th>Step Target</th><th>GRU Len</th><th>Raw Prefix Len</th><th>Prefix Preview</th></tr></thead>
+        <tbody><tr><td>1</td><td>914/frame_0.jpg</td><td>0</td><td>0</td><td>1</td><td>0</td><td>[0]</td></tr>
+<tr><td>2</td><td>914/frame_6.jpg</td><td>6</td><td>6</td><td>5</td><td>28</td><td>[2, 2, 2, 2, 2]</td></tr>
+<tr><td>3</td><td>914/frame_13.jpg</td><td>13</td><td>13</td><td>12</td><td>43</td><td>[2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]</td></tr>
+<tr><td>4</td><td>914/frame_20.jpg</td><td>20</td><td>20</td><td>19</td><td>59</td><td>[2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]</td></tr>
+<tr><td>5</td><td>914/frame_27.jpg</td><td>27</td><td>27</td><td>26</td><td>82</td><td>[2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]</td></tr>
+<tr><td>6</td><td>914/frame_34.jpg</td><td>34</td><td>34</td><td>33</td><td>99</td><td>[2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]</td></tr>
+<tr><td>7</td><td>914/frame_41.jpg</td><td>41</td><td>41</td><td>40</td><td>110</td><td>[2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]</td></tr>
+<tr><td>8</td><td>914/frame_48.jpg</td><td>48</td><td>48</td><td>47</td><td>110</td><td>[2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]</td></tr></tbody>
+      </table>
+    </section>
+
+    <section class="card c4">
+      <h2>GRU Length Profile</h2>
+      <div class='barrow'><span class='label'>H1</span><div class='bar'><div class='fill' style='width:2.1%;'></div></div><span class='val'>1</span></div>
+<div class='barrow'><span class='label'>H2</span><div class='bar'><div class='fill' style='width:10.6%;'></div></div><span class='val'>5</span></div>
+<div class='barrow'><span class='label'>H3</span><div class='bar'><div class='fill' style='width:25.5%;'></div></div><span class='val'>12</span></div>
+<div class='barrow'><span class='label'>H4</span><div class='bar'><div class='fill' style='width:40.4%;'></div></div><span class='val'>19</span></div>
+<div class='barrow'><span class='label'>H5</span><div class='bar'><div class='fill' style='width:55.3%;'></div></div><span class='val'>26</span></div>
+<div class='barrow'><span class='label'>H6</span><div class='bar'><div class='fill' style='width:70.2%;'></div></div><span class='val'>33</span></div>
+<div class='barrow'><span class='label'>H7</span><div class='bar'><div class='fill' style='width:85.1%;'></div></div><span class='val'>40</span></div>
+<div class='barrow'><span class='label'>H8</span><div class='bar'><div class='fill' style='width:100.0%;'></div></div><span class='val'>47</span></div>
+    </section>
+
+    <section class="card c4">
+      <h2>Aggregated Action Mix</h2>
+      <div class="kpi" style="grid-template-columns:1fr;">
+        <div class="k"><small>forward</small><div class="v">28</div></div>
+        <div class="k"><small>turn_left</small><div class="v">154</div></div>
+        <div class="k"><small>turn_right</small><div class="v">0</div></div>
+        <div class="k"><small>stop</small><div class="v">1</div></div>
+      </div>
+    </section>
+
+    <section class="card c4">
+      <h2>Instruction + Target</h2>
+      <div><small>q</small></div>
+      <pre>Turn and walk away from the bathroom into the bedroom area. Walk through the open door on the other side of the room and into the dining room area at the end of the hallway. Stop near the couches in the next room passed the kitchen. </pre>
+      <div style="margin-top:8px;"><small>a</small></div>
+      <pre>The next action is move forward 75 cm.</pre>
+    </section>
+
+        <section class="card c12">
+            <h2>Prompt Structured View (Messages To LLM)</h2>
+            <small>Same content as raw prompt, grouped by role and content blocks.</small>
+            <div class='msgcard'><div class='msghead'>Message 1 - role=system</div><div class='msgtext'>You are a helpful navigation assistant.</div></div>
+<div class='msgcard'><div class='msghead'>Message 2 - role=user</div><div class='msgtext'>You are a robot agent programmed for navigation tasks. Below are historical observations consisting of an image and trajectory memory tokens.</div><div class='msgtext'>History 1\nFrame id: 914/frame_0.jpg\nTrajectory memory tokens: &lt;motion&gt;</div><div class='msgimg'>image: /home/rithvik/IROS_proj/NaVILA-Dataset/R2R/train/914/frame_0.jpg</div><div class='msgtext'>History 2\nFrame id: 914/frame_6.jpg\nTrajectory memory tokens: &lt;motion&gt;</div><div class='msgimg'>image: /home/rithvik/IROS_proj/NaVILA-Dataset/R2R/train/914/frame_6.jpg</div><div class='msgtext'>History 3\nFrame id: 914/frame_13.jpg\nTrajectory memory tokens: &lt;motion&gt;</div><div class='msgimg'>image: /home/rithvik/IROS_proj/NaVILA-Dataset/R2R/train/914/frame_13.jpg</div><div class='msgtext'>History 4\nFrame id: 914/frame_20.jpg\nTrajectory memory tokens: &lt;motion&gt;</div><div class='msgimg'>image: /home/rithvik/IROS_proj/NaVILA-Dataset/R2R/train/914/frame_20.jpg</div><div class='msgtext'>History 5\nFrame id: 914/frame_27.jpg\nTrajectory memory tokens: &lt;motion&gt;</div><div class='msgimg'>image: /home/rithvik/IROS_proj/NaVILA-Dataset/R2R/train/914/frame_27.jpg</div><div class='msgtext'>History 6\nFrame id: 914/frame_34.jpg\nTrajectory memory tokens: &lt;motion&gt;</div><div class='msgimg'>image: /home/rithvik/IROS_proj/NaVILA-Dataset/R2R/train/914/frame_34.jpg</div><div class='msgtext'>History 7\nFrame id: 914/frame_41.jpg\nTrajectory memory tokens: &lt;motion&gt;</div><div class='msgimg'>image: /home/rithvik/IROS_proj/NaVILA-Dataset/R2R/train/914/frame_41.jpg</div><div class='msgtext'>Current observation\nFrame id: 914/frame_48.jpg\nTrajectory memory tokens: &lt;motion&gt;</div><div class='msgimg'>image: /home/rithvik/IROS_proj/NaVILA-Dataset/R2R/train/914/frame_48.jpg</div><div class='msgtext'>Instruction: Turn and walk away from the bathroom into the bedroom area. Walk through the open door on the other side of the room and into the dining room area at the end of the hallway. Stop near the couches in the next room passed the kitchen. \n\nPredict the next navigation action. Valid answers should be concise, for example: 'turn left 15 degrees', 'turn right 30 degrees', 'move forward 75 cm', or 'stop'.</div></div>
+<div class='msgcard'><div class='msghead'>Message 3 - role=assistant</div><div class='msgtext'>move forward 75 cm</div></div>
+        </section>
+  </div>
+</div>
+</body>
+</html>
