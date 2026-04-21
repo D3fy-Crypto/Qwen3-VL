@@ -24,11 +24,14 @@ DEEPSPEED=${DEEPSPEED:-./scripts/zero3.json}
 
 # Model configuration
 MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH:-/home/rithvik/IROS_proj/cvpr_proj/qwen_models/instruct}
-GRU_QWEN_CHECKPOINT_PATH=${GRU_QWEN_CHECKPOINT_PATH:-/home/rithvik/Desktop/allignment_training_copy/output_traj_grounding_simclr/checkpoint-75732}
+GRU_QWEN_CHECKPOINT_PATH=${GRU_QWEN_CHECKPOINT_PATH:-}
+ALIGNMENT_MODULES_CHECKPOINT_PATH=${ALIGNMENT_MODULES_CHECKPOINT_PATH:-}
 
 # GRU-specific configuration
 GRU_CHECKPOINT_PATH=${GRU_CHECKPOINT_PATH:-}
 PROJECTOR_K=${PROJECTOR_K:-1}
+QWEN_LM_UNFREEZE_LAST_N_LAYERS=${QWEN_LM_UNFREEZE_LAST_N_LAYERS:-0}
+QWEN_UNFREEZE_LM_HEAD=${QWEN_UNFREEZE_LM_HEAD:-False}
 
 # Training hyperparameters
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
@@ -54,11 +57,12 @@ ENTRY_FILE=qwenvl/train/train_gru_qwen.py
 # Build arguments as an array so smoke-test overrides stay easy to read.
 args=(
     --model_name_or_path "${MODEL_NAME_OR_PATH}"
-    --gru_qwen_checkpoint_path "${GRU_QWEN_CHECKPOINT_PATH}"
     --projector_k "${PROJECTOR_K}"
     --tune_projector True
     --tune_qwen_vision False
     --tune_qwen_lm False
+    --qwen_lm_unfreeze_last_n_layers "${QWEN_LM_UNFREEZE_LAST_N_LAYERS}"
+    --qwen_unfreeze_lm_head "${QWEN_UNFREEZE_LM_HEAD}"
     --dataset_use "${DATASETS}"
     --data_flatten False
     --bf16
@@ -94,6 +98,14 @@ if [[ -n "${GRU_CHECKPOINT_PATH}" ]]; then
     args+=(--gru_checkpoint_path "${GRU_CHECKPOINT_PATH}")
 fi
 
+if [[ -n "${GRU_QWEN_CHECKPOINT_PATH}" ]]; then
+    args+=(--gru_qwen_checkpoint_path "${GRU_QWEN_CHECKPOINT_PATH}")
+fi
+
+if [[ -n "${ALIGNMENT_MODULES_CHECKPOINT_PATH}" ]]; then
+    args+=(--alignment_modules_checkpoint_path "${ALIGNMENT_MODULES_CHECKPOINT_PATH}")
+fi
+
 if [[ "${USE_DEEPSPEED}" == "1" && -n "${DEEPSPEED}" ]]; then
     args=(--deepspeed "${DEEPSPEED}" "${args[@]}")
 fi
@@ -107,7 +119,10 @@ echo "GRU-Qwen Training"
 echo "========================================"
 echo "Model: ${MODEL_NAME_OR_PATH}"
 echo "GRU-Qwen Checkpoint: ${GRU_QWEN_CHECKPOINT_PATH}"
+echo "Alignment Modules Checkpoint: ${ALIGNMENT_MODULES_CHECKPOINT_PATH}"
 echo "GRU Checkpoint: ${GRU_CHECKPOINT_PATH}"
+echo "Qwen LM Last-N Unfreeze: ${QWEN_LM_UNFREEZE_LAST_N_LAYERS}"
+echo "Qwen LM Head Unfreeze: ${QWEN_UNFREEZE_LM_HEAD}"
 echo "Dataset: ${DATASETS}"
 echo "Output Dir: ${OUTPUT_DIR}"
 echo "Learning Rate: ${LEARNING_RATE}"

@@ -74,10 +74,22 @@ class GRUQwenTrainingArguments(TrainingArguments):
         default=None,
         metadata={"help": "Optional tokenizer path. Defaults to the GRU-Qwen checkpoint tokenizer if present."},
     )
+    alignment_modules_checkpoint_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Path to a GRU-Qwen Trainer checkpoint used to warm-start only "
+                "trajectory_gru + projector weights (Qwen backbone is not loaded from it). "
+                "Compatible with DeepSpeed ZeRO-3."
+            )
+        },
+    )
     projector_k: int = field(default=1)
     tune_projector: bool = field(default=True)
     tune_qwen_vision: bool = field(default=False)
     tune_qwen_lm: bool = field(default=False)
+    qwen_lm_unfreeze_last_n_layers: int = field(default=0)
+    qwen_unfreeze_lm_head: bool = field(default=False)
     alignment_strict: bool = field(default=True)
 
 
@@ -114,6 +126,13 @@ def train(attn_implementation="flash_attention_2"):
 
     qwen_model_path = model_args.model_name_or_path
     gru_qwen_checkpoint_path = training_args.gru_qwen_checkpoint_path
+    alignment_modules_checkpoint_path = training_args.alignment_modules_checkpoint_path
+
+    if gru_qwen_checkpoint_path and alignment_modules_checkpoint_path:
+        raise ValueError(
+            "Pass either --gru_qwen_checkpoint_path (full wrapper warm-start) "
+            "or --alignment_modules_checkpoint_path (projector/GRU only), not both."
+        )
 
     if not _has_hf_config(qwen_model_path) and _looks_like_trainer_checkpoint(qwen_model_path):
         gru_qwen_checkpoint_path = gru_qwen_checkpoint_path or qwen_model_path
@@ -161,6 +180,8 @@ def train(attn_implementation="flash_attention_2"):
         tune_qwen_vision=training_args.tune_qwen_vision,
         tune_qwen_lm=training_args.tune_qwen_lm,
         tune_projector=training_args.tune_projector,
+        qwen_lm_unfreeze_last_n_layers=training_args.qwen_lm_unfreeze_last_n_layers,
+        qwen_unfreeze_lm_head=training_args.qwen_unfreeze_lm_head,
     )
 
     rank0_print(f"[GRU-Qwen] Model initialized: {model.__class__.__name__}")
@@ -208,6 +229,11 @@ def train(attn_implementation="flash_attention_2"):
         )
     model.motion_token_id = int(motion_token_id)
 
+    # Important: resize_token_embeddings can recreate embedding params with
+    # requires_grad=True. Re-apply freeze/train policy so projector-only runs
+    # stay projector-only.
+    model._set_trainable_parameters()
+
     if gru_qwen_checkpoint_path:
         checkpoint_vocab_size = GRUQwenModel.checkpoint_vocab_size(gru_qwen_checkpoint_path)
         if checkpoint_vocab_size is not None:
@@ -225,15 +251,51 @@ def train(attn_implementation="flash_attention_2"):
 
     if gru_qwen_checkpoint_path:
         model.load_gru_qwen_checkpoint(gru_qwen_checkpoint_path, strict=False)
+    elif alignment_modules_checkpoint_path:
+        model.load_alignment_modules_from_checkpoint(
+            alignment_modules_checkpoint_path, strict=False
+        )
 
-    # Enable gradient checkpointing if requested
-    if training_args.gradient_checkpointing:
+    # Re-apply trainability after any checkpoint load to guarantee the intended
+    # freeze/unfreeze policy (and avoid surprises from wrapper reload paths).
+    model._set_trainable_parameters()
+
+    # Enable gradient-checkpointing input-grad hook only when Qwen has trainable params.
+    # In projector-only alignment runs, forcing embedding grads can accidentally unfreeze
+    # a huge embedding matrix.
+    qwen_has_trainable = any(p.requires_grad for p in model.qwen.parameters())
+    requested_qwen_unfreeze = (
+        training_args.tune_qwen_lm
+        or training_args.qwen_lm_unfreeze_last_n_layers > 0
+        or training_args.qwen_unfreeze_lm_head
+        or training_args.tune_qwen_vision
+    )
+    if requested_qwen_unfreeze and (not qwen_has_trainable):
+        raise RuntimeError(
+            "Requested Qwen unfreeze, but no Qwen parameters are trainable. "
+            "Check model wrapping/path compatibility before launching DeepSpeed."
+        )
+    if training_args.gradient_checkpointing and getattr(training_args, "deepspeed", None):
+        rank0_print(
+            "[GRU-Qwen] Disabling gradient checkpointing for DeepSpeed run "
+            "to avoid ZeRO recompute metadata mismatch in this wrapper path."
+        )
+        training_args.gradient_checkpointing = False
+        if hasattr(model, "gradient_checkpointing_disable"):
+            model.gradient_checkpointing_disable()
+
+    if training_args.gradient_checkpointing and qwen_has_trainable:
         if hasattr(model.qwen, "enable_input_require_grads"):
             model.qwen.enable_input_require_grads()
         else:
             def make_inputs_require_grad(module, input, output):
                 output.requires_grad_(True)
             model.qwen.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+    elif training_args.gradient_checkpointing and (not qwen_has_trainable):
+        rank0_print(
+            "[GRU-Qwen] Skipping Qwen input-grad hook for gradient checkpointing "
+            "because Qwen params are frozen (projector-only mode)."
+        )
 
     # Use LoRA if enabled
     if training_args.lora_enable:
@@ -257,7 +319,9 @@ def train(attn_implementation="flash_attention_2"):
     if (not torch.distributed.is_available()) or (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0:
         rank0_print()
         model.print_trainable_parameters()
-        stats = model.validate_alignment_setup(strict=training_args.alignment_strict)
+        # Auto-disable strict validation for unified model loading (no gru_qwen_checkpoint_path)
+        use_strict = training_args.alignment_strict and (gru_qwen_checkpoint_path or False)
+        stats = model.validate_alignment_setup(strict=use_strict)
         rank0_print("[GRU-Qwen][alignment-check]")
         rank0_print(f"  total Qwen params: {stats['qwen_total']:,}")
         rank0_print(f"  trainable Qwen params: {stats['qwen_trainable']:,}")
