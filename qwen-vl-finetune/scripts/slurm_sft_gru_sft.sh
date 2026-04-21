@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=qwen3vl_sft_gru
-#SBATCH --partition=l40s
-#SBATCH --gres=gpu:l40s:8
+#SBATCH --partition=a100
+#SBATCH --gres=gpu:a100:8
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=256G
 #SBATCH --time=24:00:00
@@ -90,7 +90,7 @@ torchrun \
     --nproc_per_node=${NPROC_PER_NODE} \
     --master_addr=${MASTER_ADDR} \
     --master_port=${MASTER_PORT} \
-    qwenvl/train/train_gru_sft_qwen.py \
+    qwenvl/train/train_gru_qwen.py \
         ${DEEPSPEED_ARG} \
         --model_name_or_path "${MODEL_PATH}" \
         --gru_warmstart_ckpt "${GRU_WARMSTART}" \

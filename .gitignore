@@ -11,3 +11,5 @@ __pycache__/
 
 /qwen-vl-finetune/output_gru_qwen_smoke/*
 .gitignrore
+**.log
+
