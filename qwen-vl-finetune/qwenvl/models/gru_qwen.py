@@ -51,7 +51,9 @@ class GRUQwenModel(nn.Module):
                  dtype = None,
                  tune_qwen_vision: bool = False,
                  tune_qwen_lm: bool = False,
-                 tune_projector: bool = True):
+                 tune_projector: bool = True,
+                 qwen_lm_unfreeze_last_n_layers: int = 0,
+                 qwen_unfreeze_lm_head: bool = False):
         """
         Args:
             qwen_model_id: HuggingFace model ID for Qwen (e.g., "Qwen/Qwen2.5-VL-7B")
@@ -72,6 +74,8 @@ class GRUQwenModel(nn.Module):
         self.tune_qwen_vision = tune_qwen_vision
         self.tune_qwen_lm = tune_qwen_lm
         self.tune_projector = tune_projector
+        self.qwen_lm_unfreeze_last_n_layers = max(0, int(qwen_lm_unfreeze_last_n_layers))
+        self.qwen_unfreeze_lm_head = qwen_unfreeze_lm_head
         self.motion_token_id = motion_token_id
         
         # Load Qwen model first to derive hidden size.
@@ -229,6 +233,89 @@ class GRUQwenModel(nn.Module):
             "mismatched": mismatched,
         }
 
+    def load_alignment_modules_from_checkpoint(
+        self, checkpoint_path: str, strict: bool = False
+    ) -> Dict[str, list]:
+        """
+        Load only alignment modules (trajectory_gru + projector) from a GRU-Qwen
+        Trainer checkpoint and intentionally skip all Qwen backbone weights.
+
+        This is useful when DeepSpeed ZeRO-3 is enabled and we want a lightweight
+        warm-start without loading a full wrapper state dict.
+        """
+        path = Path(checkpoint_path)
+        if path.is_dir():
+            safetensor_path = path / "model.safetensors"
+            if safetensor_path.exists():
+                path = safetensor_path
+            else:
+                raise FileNotFoundError(
+                    f"No model.safetensors found under alignment checkpoint dir: {checkpoint_path}"
+                )
+        if not path.exists():
+            raise FileNotFoundError(f"Alignment checkpoint not found: {path}")
+
+        if path.suffix == ".safetensors":
+            try:
+                from safetensors.torch import load_file
+            except ImportError as exc:
+                raise ImportError(
+                    "Loading alignment .safetensors checkpoints requires the safetensors package."
+                ) from exc
+            state_dict = load_file(str(path), device="cpu")
+        else:
+            checkpoint = torch.load(path, map_location="cpu")
+            state_dict = checkpoint.get("model_state_dict", checkpoint)
+
+        keep_prefixes = ("trajectory_gru.", "projector.")
+        module_state = {
+            key: value
+            for key, value in state_dict.items()
+            if any(key.startswith(prefix) for prefix in keep_prefixes)
+        }
+        if len(module_state) == 0:
+            raise RuntimeError(
+                "No trajectory_gru/projector weights found in checkpoint. "
+                f"Expected prefixes: {keep_prefixes}"
+            )
+
+        current_state = self.state_dict()
+        compatible_state = {}
+        mismatched = []
+        for key, value in module_state.items():
+            current_value = current_state.get(key)
+            if current_value is not None and tuple(current_value.shape) != tuple(value.shape):
+                mismatched.append((key, tuple(value.shape), tuple(current_value.shape)))
+                continue
+            compatible_state[key] = value
+
+        missing, unexpected = self.load_state_dict(compatible_state, strict=strict)
+        del state_dict
+        del module_state
+        del compatible_state
+        if "checkpoint" in locals():
+            del checkpoint
+
+        loaded_gru = sum(1 for k in current_state.keys() if k.startswith("trajectory_gru.") and k not in missing)
+        loaded_projector = sum(1 for k in current_state.keys() if k.startswith("projector.") and k not in missing)
+        print(
+            f"[GRU-Qwen] Loaded alignment modules from {path} "
+            f"(gru_keys_loaded={loaded_gru}, projector_keys_loaded={loaded_projector}, "
+            f"missing={len(missing)}, unexpected={len(unexpected)}, "
+            f"mismatched_skipped={len(mismatched)}, strict={strict})"
+        )
+        if mismatched:
+            preview = ", ".join(
+                f"{key}: ckpt{src}->model{dst}" for key, src, dst in mismatched[:5]
+            )
+            print(f"[GRU-Qwen] Skipped mismatched alignment tensors: {preview}")
+
+        return {
+            "missing": list(missing),
+            "unexpected": list(unexpected),
+            "mismatched": mismatched,
+        }
+
     @staticmethod
     def checkpoint_vocab_size(checkpoint_path: str) -> Optional[int]:
         """Return checkpoint embedding rows without materializing tensors."""
@@ -255,6 +342,14 @@ class GRUQwenModel(nn.Module):
                 return int(shape[0])
         return None
 
+    def _get_qwen_language_model(self):
+        if hasattr(self.qwen, "language_model"):
+            return self.qwen.language_model
+        model_obj = getattr(self.qwen, "model", None)
+        if model_obj is not None and hasattr(model_obj, "language_model"):
+            return model_obj.language_model
+        return None
+
     def _set_trainable_parameters(self):
         """Configure which parameters should be trained."""
         # Freeze Qwen entirely by default.
@@ -266,10 +361,40 @@ class GRUQwenModel(nn.Module):
             for param in self.qwen.visual.parameters():
                 param.requires_grad = True
         
-        # Unfreeze language model if requested
-        if self.tune_qwen_lm and hasattr(self.qwen, 'language_model'):
-            for param in self.qwen.language_model.parameters():
+        language_model = self._get_qwen_language_model()
+
+        # Full LM unfreeze.
+        if self.tune_qwen_lm and language_model is not None:
+            for param in language_model.parameters():
                 param.requires_grad = True
+            if hasattr(self.qwen, "lm_head"):
+                for param in self.qwen.lm_head.parameters():
+                    param.requires_grad = True
+
+        # Partial LM unfreeze: last N decoder layers only.
+        if (not self.tune_qwen_lm) and self.qwen_lm_unfreeze_last_n_layers > 0 and language_model is not None:
+            layers = getattr(language_model, "layers", None)
+            if layers is not None and len(layers) > 0:
+                n = min(self.qwen_lm_unfreeze_last_n_layers, len(layers))
+                for layer in layers[-n:]:
+                    for param in layer.parameters():
+                        param.requires_grad = True
+                # also unfreeze final norm for stability in partial LM tuning
+                final_norm = getattr(language_model, "norm", None)
+                if final_norm is not None:
+                    for param in final_norm.parameters():
+                        param.requires_grad = True
+                lm_trainable = sum(
+                    p.numel() for p in language_model.parameters() if p.requires_grad
+                )
+                print(
+                    f"[GRU-Qwen] Partially unfroze Qwen LM last {n} layer(s) + final norm "
+                    f"(lm_trainable_params={lm_trainable:,})"
+                )
+            if self.qwen_unfreeze_lm_head and hasattr(self.qwen, "lm_head"):
+                for param in self.qwen.lm_head.parameters():
+                    param.requires_grad = True
+                print("[GRU-Qwen] Unfroze Qwen lm_head")
         
         # Projector is trainable by default
         if not self.tune_projector:
@@ -328,26 +453,31 @@ class GRUQwenModel(nn.Module):
         if labels is not None:
             labels = labels.to(self.device)
         
-        with torch.no_grad():
-            if gru_features.dim() == 4:
-                bsz, num_slots, max_t, feat_dim = gru_features.shape
-                flat_features = gru_features.reshape(bsz * num_slots, max_t, feat_dim)
-                flat_lengths = gru_lengths.reshape(bsz * num_slots)
-                flat_lengths = flat_lengths.clamp(min=1, max=max_t)
+        if gru_features.dim() == 4:
+            bsz, num_slots, max_t, feat_dim = gru_features.shape
+            flat_features = gru_features.reshape(bsz * num_slots, max_t, feat_dim)
+            flat_lengths = gru_lengths.reshape(bsz * num_slots)
+            flat_lengths = flat_lengths.clamp(min=1, max=max_t)
 
+            # Frozen GRU encoder.
+            with torch.no_grad():
                 flat_hidden = self.trajectory_gru.encode_sequence(flat_features, flat_lengths)
-                flat_last_idx = (flat_lengths - 1).to(dtype=torch.long)
-                flat_last = flat_hidden[
-                    torch.arange(flat_hidden.shape[0], device=flat_hidden.device),
-                    flat_last_idx,
-                    :,
-                ]
+            flat_last_idx = (flat_lengths - 1).to(dtype=torch.long)
+            flat_last = flat_hidden[
+                torch.arange(flat_hidden.shape[0], device=flat_hidden.device),
+                flat_last_idx,
+                :,
+            ]
 
-                projected = self.projector(flat_last).reshape(bsz, num_slots, -1)
-                gru_hidden = flat_hidden.reshape(bsz, num_slots, max_t, -1)
-            else:
+            # Trainable projector must run with grad enabled.
+            projected = self.projector(flat_last).reshape(bsz, num_slots, -1)
+            gru_hidden = flat_hidden.reshape(bsz, num_slots, max_t, -1)
+        else:
+            # Frozen GRU encoder.
+            with torch.no_grad():
                 gru_hidden = self.trajectory_gru.encode_sequence(gru_features, gru_lengths)
-                projected = self.projector(gru_hidden)
+            # Trainable projector must run with grad enabled.
+            projected = self.projector(gru_hidden)
 
         if input_ids is not None:
             input_embeds = self.qwen.get_input_embeddings()(input_ids)
@@ -358,14 +488,14 @@ class GRUQwenModel(nn.Module):
         labels_for_model = labels.clone() if labels is not None else None
 
         if input_embeds is not None:
-            # Clone to avoid in-place indexed writes on a leaf tensor during training.
-            combined_embeds = input_embeds.clone()
             combined_attention = attention_mask if attention_mask is not None else torch.ones(
                 input_embeds.shape[:2], device=self.device, dtype=torch.long
             )
 
             placement_stats = []
-            for b in range(combined_embeds.shape[0]):
+            aligned_rows = []
+            mask_rows = []
+            for b in range(input_embeds.shape[0]):
                 if gru_lengths.dim() == 2:
                     seq_len = int((gru_lengths[b] > 0).sum().item())
                 else:
@@ -381,18 +511,31 @@ class GRUQwenModel(nn.Module):
                     valid_positions = (
                         combined_attention[b].nonzero(as_tuple=False).squeeze(-1)
                         if combined_attention is not None
-                        else torch.arange(combined_embeds.shape[1], device=combined_embeds.device)
+                        else torch.arange(input_embeds.shape[1], device=input_embeds.device)
                     )
                     motion_positions = valid_positions[:seq_len]
 
+                row_aligned = torch.zeros_like(input_embeds[b])
+                row_mask = torch.zeros(
+                    (input_embeds.shape[1], 1),
+                    device=input_embeds.device,
+                    dtype=input_embeds.dtype,
+                )
                 use_n = min(int(motion_positions.numel()), seq_len)
                 if use_n > 0:
                     use_pos = motion_positions[:use_n]
-                    combined_embeds[b, use_pos, :] = projected[b, :use_n, :]
+                    row_aligned = row_aligned.index_copy(0, use_pos, projected[b, :use_n, :])
+                    row_mask = row_mask.index_fill(0, use_pos, 1.0)
                     if labels_for_model is not None:
                         labels_for_model[b, use_pos] = -100
 
+                aligned_rows.append(row_aligned)
+                mask_rows.append(row_mask)
                 placement_stats.append((int(motion_positions.numel()), use_n, seq_len))
+
+            aligned_projected = torch.stack(aligned_rows, dim=0)
+            inject_mask = torch.stack(mask_rows, dim=0)
+            combined_embeds = input_embeds * (1.0 - inject_mask) + aligned_projected * inject_mask
         else:
             combined_embeds = projected
             combined_attention = torch.ones(
@@ -429,12 +572,23 @@ class GRUQwenModel(nn.Module):
         
         outputs = self.qwen(**model_kwargs)
 
+        loss = outputs.loss if hasattr(outputs, "loss") else None
+        if loss is None:
+            raise RuntimeError(
+                "[GRU-Qwen] Qwen forward returned no loss. "
+                "Ensure labels contain supervised tokens (not all -100)."
+            )
+        if isinstance(loss, torch.Tensor) and loss.ndim > 0:
+            loss = loss.mean()
+
         if not self._debug_once and hasattr(outputs, "logits"):
             print(f"[GRU-Qwen][debug] logits shape={tuple(outputs.logits.shape)}")
+            if isinstance(loss, torch.Tensor):
+                print(f"[GRU-Qwen][debug] loss shape={tuple(loss.shape)}")
             self._debug_once = True
         
         return {
-            "loss": outputs.loss if hasattr(outputs, "loss") else None,
+            "loss": loss,
             "logits": outputs.logits if hasattr(outputs, "logits") else None,
             "hidden_states": outputs.hidden_states if hasattr(outputs, "hidden_states") else None,
             "attentions": outputs.attentions if hasattr(outputs, "attentions") else None,
@@ -442,17 +596,22 @@ class GRUQwenModel(nn.Module):
 
     def get_trainable_params_count(self) -> Dict[str, int]:
         """Return total and trainable parameter counts for all major modules."""
-        qwen_total = sum(p.numel() for p in self.qwen.parameters())
-        qwen_trainable = sum(p.numel() for p in self.qwen.parameters() if p.requires_grad)
+        def _param_size(p):
+            # ZeRO-3 can expose local partition tensors with numel()==0 during init.
+            # ds_numel keeps the global logical size when available.
+            return int(getattr(p, "ds_numel", p.numel()))
 
-        gru_total = sum(p.numel() for p in self.trajectory_gru.parameters())
+        qwen_total = sum(_param_size(p) for p in self.qwen.parameters())
+        qwen_trainable = sum(_param_size(p) for p in self.qwen.parameters() if p.requires_grad)
+
+        gru_total = sum(_param_size(p) for p in self.trajectory_gru.parameters())
         gru_trainable = sum(
-            p.numel() for p in self.trajectory_gru.parameters() if p.requires_grad
+            _param_size(p) for p in self.trajectory_gru.parameters() if p.requires_grad
         )
 
-        projector_total = sum(p.numel() for p in self.projector.parameters())
+        projector_total = sum(_param_size(p) for p in self.projector.parameters())
         projector_trainable = sum(
-            p.numel() for p in self.projector.parameters() if p.requires_grad
+            _param_size(p) for p in self.projector.parameters() if p.requires_grad
         )
 
         total_params = qwen_total + gru_total + projector_total
