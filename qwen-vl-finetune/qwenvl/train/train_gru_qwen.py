@@ -16,6 +16,7 @@ import transformers
 import sys
 from pathlib import Path
 from dataclasses import dataclass, field
+from typing import Optional
 
 project_root = Path(__file__).parent.parent.parent
 if str(project_root) not in sys.path:
@@ -51,11 +52,48 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
 class GRUQwenTrainingArguments(TrainingArguments):
     """Extended training arguments for GRU-Qwen model."""
     gru_checkpoint_path: str = field(default=None)
+    gru_qwen_checkpoint_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Path to a Trainer-saved GRU-Qwen checkpoint directory or model.safetensors "
+                "used to warm-start the full wrapper."
+            )
+        },
+    )
+    qwen_base_model_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Base Qwen model path used for config/processor/model architecture when "
+                "--model_name_or_path points at a GRU-Qwen checkpoint directory."
+            )
+        },
+    )
+    tokenizer_name_or_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional tokenizer path. Defaults to the GRU-Qwen checkpoint tokenizer if present."},
+    )
     projector_k: int = field(default=1)
     tune_projector: bool = field(default=True)
     tune_qwen_vision: bool = field(default=False)
     tune_qwen_lm: bool = field(default=False)
     alignment_strict: bool = field(default=True)
+
+
+def _looks_like_trainer_checkpoint(path: str) -> bool:
+    candidate = Path(path)
+    return candidate.is_dir() and (candidate / "model.safetensors").exists()
+
+
+def _has_hf_config(path: str) -> bool:
+    candidate = Path(path)
+    return not candidate.exists() or (candidate / "config.json").exists()
+
+
+def _default_local_qwen_base() -> Optional[str]:
+    candidate = project_root.parents[1] / "qwen_models" / "instruct"
+    return str(candidate) if (candidate / "config.json").exists() else None
 
 
 def train(attn_implementation="flash_attention_2"):
@@ -74,15 +112,48 @@ def train(attn_implementation="flash_attention_2"):
         torch.float16 if training_args.fp16 else None
     )
 
+    qwen_model_path = model_args.model_name_or_path
+    gru_qwen_checkpoint_path = training_args.gru_qwen_checkpoint_path
+
+    if not _has_hf_config(qwen_model_path) and _looks_like_trainer_checkpoint(qwen_model_path):
+        gru_qwen_checkpoint_path = gru_qwen_checkpoint_path or qwen_model_path
+        qwen_model_path = training_args.qwen_base_model_path or _default_local_qwen_base()
+        if qwen_model_path is None:
+            raise ValueError(
+                "--model_name_or_path points to a GRU-Qwen checkpoint without config.json. "
+                "Pass --qwen_base_model_path with the original/base Qwen model directory."
+            )
+
+    if gru_qwen_checkpoint_path and getattr(training_args, "deepspeed", None):
+        raise ValueError(
+            "Loading --gru_qwen_checkpoint_path uses a normal full-state_dict warm-start and "
+            "is not compatible with DeepSpeed ZeRO-3 initialization. Set USE_DEEPSPEED=0 "
+            "or remove --deepspeed for this checkpoint warm-start."
+        )
+
+    tokenizer_path = training_args.tokenizer_name_or_path
+    if tokenizer_path is None and gru_qwen_checkpoint_path:
+        checkpoint_dir = Path(gru_qwen_checkpoint_path)
+        if checkpoint_dir.is_file():
+            checkpoint_dir = checkpoint_dir.parent
+        if (checkpoint_dir / "tokenizer.json").exists():
+            tokenizer_path = str(checkpoint_dir)
+    tokenizer_path = tokenizer_path or qwen_model_path
+
+    rank0_print(f"[GRU-Qwen] Base Qwen model: {qwen_model_path}")
+    if gru_qwen_checkpoint_path:
+        rank0_print(f"[GRU-Qwen] GRU-Qwen checkpoint: {gru_qwen_checkpoint_path}")
+    rank0_print(f"[GRU-Qwen] Tokenizer: {tokenizer_path}")
+
     model_config = transformers.AutoConfig.from_pretrained(
-        model_args.model_name_or_path, trust_remote_code=True
+        qwen_model_path, trust_remote_code=True
     )
     model_type = getattr(model_config, "model_type", "") or ""
     model_type_lower = model_type.lower()
 
     rank0_print(f"\n[GRU-Qwen Training] Initializing model...")
     model = GRUQwenModel(
-        qwen_model_id=model_args.model_name_or_path,
+        qwen_model_id=qwen_model_path,
         gru_checkpoint_path=training_args.gru_checkpoint_path,
         projector_k=training_args.projector_k,
         device=device,
@@ -94,10 +165,13 @@ def train(attn_implementation="flash_attention_2"):
 
     rank0_print(f"[GRU-Qwen] Model initialized: {model.__class__.__name__}")
     rank0_print(f"[GRU-Qwen] Device: {device}, dtype: {dtype}")
+    rank0_print("[GRU-Qwen] Model architecture:")
+    rank0_print(model)
 
-    if "qwen3" in model_type_lower or "qwen3" in model_args.model_name_or_path.lower():
+    qwen_path_lower = qwen_model_path.lower()
+    if "qwen3" in model_type_lower or "qwen3" in qwen_path_lower:
         data_args.model_type = "qwen3vl"
-    elif "qwen2.5" in model_type_lower or "qwen2_5" in model_type_lower or "qwen2.5" in model_args.model_name_or_path.lower():
+    elif "qwen2.5" in model_type_lower or "qwen2_5" in model_type_lower or "qwen2.5" in qwen_path_lower:
         data_args.model_type = "qwen2.5vl"
     else:
         data_args.model_type = "qwen2vl"
@@ -106,10 +180,10 @@ def train(attn_implementation="flash_attention_2"):
         f"[GRU-Qwen] Resolved model_type={model_type!r} -> data_args.model_type={data_args.model_type}"
     )
 
-    processor = AutoProcessor.from_pretrained(model_args.model_name_or_path)
+    processor = AutoProcessor.from_pretrained(qwen_model_path)
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path,
+        tokenizer_path,
         cache_dir=training_args.cache_dir,
         model_max_length=training_args.model_max_length,
         padding_side="right",
@@ -134,9 +208,23 @@ def train(attn_implementation="flash_attention_2"):
         )
     model.motion_token_id = int(motion_token_id)
 
+    if gru_qwen_checkpoint_path:
+        checkpoint_vocab_size = GRUQwenModel.checkpoint_vocab_size(gru_qwen_checkpoint_path)
+        if checkpoint_vocab_size is not None:
+            current_vocab_size = int(model.qwen.get_input_embeddings().weight.shape[0])
+            if checkpoint_vocab_size != current_vocab_size:
+                rank0_print(
+                    "[GRU-Qwen] Resizing Qwen token embeddings to checkpoint vocab "
+                    f"{checkpoint_vocab_size} (current={current_vocab_size})"
+                )
+                model.qwen.resize_token_embeddings(checkpoint_vocab_size)
+
     # Ensure dataset tokenization uses the same tokenizer instance (with motion token added).
     if hasattr(processor, "tokenizer"):
         processor.tokenizer = tokenizer
+
+    if gru_qwen_checkpoint_path:
+        model.load_gru_qwen_checkpoint(gru_qwen_checkpoint_path, strict=False)
 
     # Enable gradient checkpointing if requested
     if training_args.gradient_checkpointing:

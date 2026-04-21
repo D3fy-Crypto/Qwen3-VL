@@ -34,7 +34,7 @@ if [[ "${SMOKE:-0}" == "1" ]]; then
     MAX_STEPS_ARG="--max_steps 10"
     SAVE_STRATEGY_ARG="--save_strategy steps --save_steps 500 --save_total_limit 2"
     REPORT_ARG="--report_to none"
-    TUNE_LLM_ARG="--tune_mm_llm True --tune_qwen_lm True"
+    TUNE_LLM_ARG="--tune_mm_llm False --tune_qwen_lm False"
     PIXELS_ARG="--max_pixels 4096 --min_pixels 784"
     WORKERS_ARG="--dataloader_num_workers 4"
     DEEPSPEED_ARG="--deepspeed ./scripts/zero3.json"

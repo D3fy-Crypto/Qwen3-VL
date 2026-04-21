@@ -42,7 +42,7 @@ def add_motion_token(tokenizer, motion_token_text: str):
     return added, int(motion_token_id)
 
 
-def build_batch(args, processor, tokenizer):
+def build_data_module(args, processor):
     data_args = DataArguments(
         dataset_use=args.dataset_use,
         model_type=infer_model_type(args.model_name_or_path),
@@ -53,35 +53,51 @@ def build_batch(args, processor, tokenizer):
     else:
         module = make_gru_sft_data_module(processor, data_args)
 
-    dl = DataLoader(
-        module["train_dataset"],
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=0,
-        collate_fn=module["data_collator"],
-    )
-    return next(iter(dl))
+    return module
 
 
-def build_raw_prompt(args, processor):
-    data_args = DataArguments(
-        dataset_use=args.dataset_use,
-        model_type=infer_model_type(args.model_name_or_path),
-        motion_token_text=args.motion_token_text,
-    )
-    if args.pipeline == "gru":
-        module = make_gru_data_module(processor, data_args)
-    else:
-        module = make_gru_sft_data_module(processor, data_args)
+def pick_sample_index(dataset, requested_index: int, min_frames: int) -> int:
+    size = len(dataset)
+    if size == 0:
+        raise ValueError("Empty dataset")
 
+    if requested_index >= 0:
+        if requested_index >= size:
+            raise IndexError(f"sample_index={requested_index} out of range for dataset size {size}")
+        return requested_index
+
+    # Auto-pick the first native sample with enough frames.
+    for idx, sample in enumerate(dataset.list_data_dict):
+        if not isinstance(sample, dict):
+            continue
+        frames = sample.get("frames") or []
+        if isinstance(frames, list) and len(frames) >= min_frames:
+            return idx
+
+    # Fallback to first sample if no candidate found.
+    return 0
+
+
+def build_batch(module, args, processor, tokenizer, sample_index: int):
     dataset = module["train_dataset"]
-    source = dataset.list_data_dict[0]
+    collator = module["data_collator"]
+    size = len(dataset)
+    bsz = max(1, int(args.batch_size))
+    # Build a deterministic local window of samples for debugging.
+    indices = [int((sample_index + off) % size) for off in range(bsz)]
+    samples = [dataset[idx] for idx in indices]
+    return collator(samples), indices
+
+
+def build_raw_prompt(module, processor, sample_index: int):
+    dataset = module["train_dataset"]
+    source = dataset.list_data_dict[sample_index]
     if isinstance(source, list):
         source = source[0]
 
     frame_step_targets = None
     try:
-        sample = dataset[0]
+        sample = dataset[sample_index]
         frame_step_targets = sample.get("frame_step_targets")
         if torch.is_tensor(frame_step_targets):
             frame_step_targets = frame_step_targets.tolist()
@@ -342,6 +358,18 @@ def main():
     parser.add_argument("--motion_token_text", default="<motion>")
     parser.add_argument("--gru_checkpoint_path", default="")
     parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument(
+        "--sample_index",
+        type=int,
+        default=-1,
+        help="Dataset sample index to debug; -1 means auto-pick a non-trivial sample.",
+    )
+    parser.add_argument(
+        "--min_frames",
+        type=int,
+        default=8,
+        help="When sample_index=-1, pick first sample with at least this many frames.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     parser.add_argument("--dump_json", default="")
@@ -406,9 +434,14 @@ def main():
     if added > 0:
         model.qwen.resize_token_embeddings(len(tokenizer))
 
-    raw_debug = build_raw_prompt(args, processor)
-    batch = build_batch(args, processor, tokenizer)
+    module = build_data_module(args, processor)
+    dataset = module["train_dataset"]
+    sample_index = pick_sample_index(dataset, args.sample_index, max(1, int(args.min_frames)))
+    raw_debug = build_raw_prompt(module, processor, sample_index)
+    batch, batch_indices = build_batch(module, args, processor, tokenizer, sample_index)
     vision_disabled = bool(args.disable_vision)
+
+    print(f"[debug] using sample_index={sample_index} batch_indices={batch_indices} (dataset_size={len(dataset)})")
 
     model.eval()
     try:
@@ -481,6 +514,8 @@ def main():
             "motion_token_text": args.motion_token_text,
             "motion_token_id": motion_token_id,
             "disable_vision": vision_disabled,
+            "sample_index": sample_index,
+            "batch_indices": batch_indices,
             "raw_source_0": raw_debug["source"],
             "raw_messages_0": raw_debug["messages"],
             "raw_prompt_0": raw_debug["raw_prompt"],
