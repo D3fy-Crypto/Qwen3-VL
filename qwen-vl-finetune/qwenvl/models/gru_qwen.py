@@ -100,9 +100,7 @@ class GRUQwenModel(nn.Module):
             param.requires_grad = False
         self.trajectory_gru.eval()
 
-        qwen_hidden_dim = getattr(self.qwen.config, "hidden_size", None)
-        if qwen_hidden_dim is None:
-            qwen_hidden_dim = self.qwen.get_input_embeddings().weight.shape[1]
+        qwen_hidden_dim = self._infer_qwen_hidden_dim()
         
         # Project GRU hidden states into Qwen token embedding space.
         self.projector = ProjectorMLP(
@@ -149,6 +147,113 @@ class GRUQwenModel(nn.Module):
             kwargs["torch_dtype"] = dtype
         
         self.qwen = model_class.from_pretrained(model_id, **kwargs).to(device)
+
+    def _infer_qwen_hidden_dim(self) -> int:
+        """Infer the language embedding width across Qwen VL config variants."""
+        config_candidates = [
+            getattr(self.qwen, "config", None),
+            getattr(getattr(self.qwen, "config", None), "text_config", None),
+            getattr(getattr(self.qwen, "config", None), "llm_config", None),
+            getattr(getattr(self.qwen, "config", None), "language_config", None),
+        ]
+        for config in config_candidates:
+            hidden_size = getattr(config, "hidden_size", None)
+            if hidden_size is not None:
+                return int(hidden_size)
+
+        embedding_candidates = [
+            self.qwen.get_input_embeddings() if hasattr(self.qwen, "get_input_embeddings") else None,
+            getattr(getattr(self.qwen, "model", None), "language_model", None),
+            getattr(getattr(getattr(self.qwen, "model", None), "language_model", None), "embed_tokens", None),
+        ]
+        for embedding in embedding_candidates:
+            if embedding is None:
+                continue
+            if hasattr(embedding, "get_input_embeddings"):
+                embedding = embedding.get_input_embeddings()
+            weight = getattr(embedding, "weight", None)
+            if weight is not None and getattr(weight, "ndim", 0) >= 2:
+                return int(weight.shape[-1])
+
+        raise RuntimeError("Could not infer Qwen language hidden size for GRU projector")
+
+    def load_gru_qwen_checkpoint(self, checkpoint_path: str, strict: bool = False) -> Dict[str, list]:
+        """Load a Trainer-saved GRU-Qwen wrapper checkpoint."""
+        path = Path(checkpoint_path)
+        if path.is_dir():
+            path = path / "model.safetensors"
+        if not path.exists():
+            raise FileNotFoundError(f"GRU-Qwen checkpoint not found: {path}")
+
+        if path.suffix == ".safetensors":
+            try:
+                from safetensors.torch import load_file
+            except ImportError as exc:
+                raise ImportError(
+                    "Loading GRU-Qwen .safetensors checkpoints requires the safetensors package."
+                ) from exc
+            # Stage on CPU to avoid a second full Qwen copy on GPU during warm-start.
+            state_dict = load_file(str(path), device="cpu")
+        else:
+            checkpoint = torch.load(path, map_location="cpu")
+            state_dict = checkpoint.get("model_state_dict", checkpoint)
+
+        current_state = self.state_dict()
+        compatible_state = {}
+        mismatched = []
+        for key, value in state_dict.items():
+            current_value = current_state.get(key)
+            if current_value is not None and tuple(current_value.shape) != tuple(value.shape):
+                mismatched.append((key, tuple(value.shape), tuple(current_value.shape)))
+                continue
+            compatible_state[key] = value
+
+        missing, unexpected = self.load_state_dict(compatible_state, strict=strict)
+        del state_dict
+        del compatible_state
+        if "checkpoint" in locals():
+            del checkpoint
+        print(
+            f"[GRU-Qwen] Loaded GRU-Qwen checkpoint from {path} "
+            f"(missing={len(missing)}, unexpected={len(unexpected)}, "
+            f"mismatched_skipped={len(mismatched)}, strict={strict})"
+        )
+        if mismatched:
+            preview = ", ".join(
+                f"{key}: ckpt{src}->model{dst}" for key, src, dst in mismatched[:5]
+            )
+            print(f"[GRU-Qwen] Skipped mismatched checkpoint tensors: {preview}")
+        return {
+            "missing": list(missing),
+            "unexpected": list(unexpected),
+            "mismatched": mismatched,
+        }
+
+    @staticmethod
+    def checkpoint_vocab_size(checkpoint_path: str) -> Optional[int]:
+        """Return checkpoint embedding rows without materializing tensors."""
+        path = Path(checkpoint_path)
+        if path.is_dir():
+            path = path / "model.safetensors"
+        if not path.exists() or path.suffix != ".safetensors":
+            return None
+
+        import json
+        import struct
+
+        with path.open("rb") as handle:
+            header_size = struct.unpack("<Q", handle.read(8))[0]
+            header = json.loads(handle.read(header_size))
+
+        for key in (
+            "qwen.model.language_model.embed_tokens.weight",
+            "qwen.model.embed_tokens.weight",
+            "qwen.lm_head.weight",
+        ):
+            shape = header.get(key, {}).get("shape")
+            if shape and len(shape) >= 2:
+                return int(shape[0])
+        return None
 
     def _set_trainable_parameters(self):
         """Configure which parameters should be trained."""
@@ -253,7 +358,8 @@ class GRUQwenModel(nn.Module):
         labels_for_model = labels.clone() if labels is not None else None
 
         if input_embeds is not None:
-            combined_embeds = input_embeds
+            # Clone to avoid in-place indexed writes on a leaf tensor during training.
+            combined_embeds = input_embeds.clone()
             combined_attention = attention_mask if attention_mask is not None else torch.ones(
                 input_embeds.shape[:2], device=self.device, dtype=torch.long
             )

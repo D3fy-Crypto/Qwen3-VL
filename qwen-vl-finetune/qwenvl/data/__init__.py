@@ -7,6 +7,14 @@ if _LOCAL_NAVILA_BASE.exists():
 else:
     NAVILA_BASE = "/weka/scratch/tinoosh/iros_dataset/NaVILA-Dataset"
 
+
+def _first_existing_path(candidates):
+    for candidate in candidates:
+        path = Path(candidate)
+        if path.exists():
+            return str(path)
+    return str(Path(candidates[0]))
+
 R2R = {
     "annotation_path": f"{NAVILA_BASE}/R2R/annotations.json",
     "data_path": f"{NAVILA_BASE}/R2R/train",
@@ -32,9 +40,22 @@ SCANQA = {
     "data_path": f"{NAVILA_BASE}/ScanQA/videos",
 }
 
+_R2R_ALIGNMENT_QA_ANN = _first_existing_path(
+    [
+        "/home/rithvik/IROS_proj/cvpr_proj/llm_test/r2r_alignment_dataset_qa.json",
+        "/home/rithvik/IROS_proj/llm_test/r2r_alignment_dataset_qa.json",
+    ]
+)
+_R2R_ALIGNMENT_QA_DATA = _first_existing_path(
+    [
+        "/home/rithvik/IROS_proj/cvpr_proj/llm_test",
+        "/home/rithvik/IROS_proj/llm_test",
+    ]
+)
+
 R2R_ALIGNMENT_QA = {
-    "annotation_path": "/home/rithvik/IROS_proj/llm_test/r2r_alignment_dataset_qa.json",
-    "data_path": "/home/rithvik/IROS_proj/llm_test",
+    "annotation_path": _R2R_ALIGNMENT_QA_ANN,
+    "data_path": _R2R_ALIGNMENT_QA_DATA,
 }
 
 data_dict = {

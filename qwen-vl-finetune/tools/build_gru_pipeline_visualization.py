@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Tuple
 DEGREE_PATTERN = re.compile(r"(\d+)\s*degree", re.IGNORECASE)
 CM_PATTERN = re.compile(r"(\d+)\s*cm", re.IGNORECASE)
 FRAME_PATTERN = re.compile(r"frame_(\d+)", re.IGNORECASE)
+GENERIC_FRAME_PATTERN = re.compile(r"(\d+)\.(?:jpg|jpeg|png|webp)$", re.IGNORECASE)
 
 STOP = 0
 FORWARD = 1
@@ -59,7 +60,10 @@ def action_codes_from_answer(answer: str) -> List[int]:
 
 def extract_frame_index(frame_id: str) -> int:
     m = FRAME_PATTERN.search(str(frame_id))
-    return int(m.group(1)) if m else -1
+    if m:
+        return int(m.group(1))
+    m2 = GENERIC_FRAME_PATTERN.search(str(frame_id))
+    return int(m2.group(1)) if m2 else -1
 
 
 def load_annotations(annotation_path: Path) -> List[dict]:
@@ -71,14 +75,18 @@ def load_annotations(annotation_path: Path) -> List[dict]:
 
 def build_traj_steps(annotations: List[dict], traj: str) -> List[Tuple[int, List[int], str]]:
     rows: List[Tuple[int, List[int], str]] = []
+    seen_steps = set()
     prefix = f"{traj}-"
     for ann in annotations:
         vid = str(ann.get("video_id", ""))
         if not vid.startswith(prefix):
             continue
         _, step = parse_video_id(vid)
+        if step in seen_steps:
+            continue
         ans = str(ann.get("a", ""))
         rows.append((step, action_codes_from_answer(ans), ans))
+        seen_steps.add(step)
     rows.sort(key=lambda x: x[0])
     return rows
 
@@ -120,6 +128,28 @@ def html_escape(text: str) -> str:
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
+
+
+def truncate_text(text: str, max_chars: int = 8000) -> str:
+    if len(text) <= max_chars:
+        return text
+    head = text[: max_chars // 2]
+    tail = text[-(max_chars // 2) :]
+    return f"{head}\n... [truncated] ...\n{tail}"
+
+
+def find_annotation_samples(annotations: List[dict], video_id: str, max_samples: int = 3) -> Tuple[List[dict], str]:
+    exact = [ann for ann in annotations if str(ann.get("video_id", "")) == str(video_id)]
+    if exact:
+        return exact[:max_samples], "exact video_id match"
+
+    traj, _ = parse_video_id(video_id)
+    prefix = f"{traj}-"
+    prefix_matches = [ann for ann in annotations if str(ann.get("video_id", "")).startswith(prefix)]
+    if prefix_matches:
+        return prefix_matches[:max_samples], "trajectory prefix match"
+
+    return [], "no matching annotation row found"
 
 
 def round_num(v: Any, digits: int = 3) -> Any:
@@ -174,7 +204,15 @@ def render_structured_messages(messages: List[dict]) -> str:
     return "\n".join(blocks)
 
 
-def build_html(payload: dict, annotation_path: Path, slot_rows: List[dict], step_rows: List[Tuple[int, List[int], str]]) -> str:
+def build_html(
+    payload: dict,
+    annotation_path: Path,
+    slot_rows: List[dict],
+    step_rows: List[Tuple[int, List[int], str]],
+    selected_video_id: str,
+    annotation_samples: List[dict],
+    annotation_match_mode: str,
+) -> str:
     source = payload.get("raw_source_0", {})
     q = source.get("q", "")
     a = source.get("a", "")
@@ -223,6 +261,9 @@ def build_html(payload: dict, annotation_path: Path, slot_rows: List[dict], step
         )
     slot_io_html = "\n".join(slot_io_rows)
     messages_html = render_structured_messages(messages)
+    sample_json = truncate_text(
+        json.dumps(annotation_samples, indent=2, ensure_ascii=False) if annotation_samples else "[]"
+    )
 
     return f"""<!doctype html>
 <html lang=\"en\">
@@ -317,6 +358,12 @@ code {{ background:#f8fafc; border:1px solid var(--line); border-radius:8px; pad
       <div style=\"margin-top:10px;\"><small>motion_positions_0: {html_escape(motion_positions)}</small></div>
     </section>
 
+        <section class="card c12">
+            <h2>Source Annotation Sample(s)</h2>
+            <small>selected_video_id: {html_escape(selected_video_id)} | match mode: {html_escape(annotation_match_mode)} | rows shown: {len(annotation_samples)}</small>
+            <pre>{html_escape(sample_json)}</pre>
+        </section>
+
     <section class=\"card c6\">
       <h2>Action Set Extracted From DB</h2>
       <small>Parsed from answers in annotations for this trajectory.</small>
@@ -397,6 +444,7 @@ def main() -> None:
     annotation_path = Path(args.annotation_path) if args.annotation_path else inferred_ann
 
     annotations = load_annotations(annotation_path)
+    annotation_samples, annotation_match_mode = find_annotation_samples(annotations, video_id)
     step_rows = build_traj_steps(annotations, traj)
     cmap = cumulative_map(step_rows)
 
@@ -439,7 +487,18 @@ def main() -> None:
         )
 
     output_html = Path(args.output_html) if args.output_html else debug_json.with_name("gru_pipeline_visualization.html")
-    output_html.write_text(build_html(payload, annotation_path, slot_rows, step_rows), encoding="utf-8")
+    output_html.write_text(
+        build_html(
+            payload,
+            annotation_path,
+            slot_rows,
+            step_rows,
+            video_id,
+            annotation_samples,
+            annotation_match_mode,
+        ),
+        encoding="utf-8",
+    )
     print(f"Wrote rich pipeline visualization: {output_html}")
 
 

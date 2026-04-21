@@ -38,7 +38,7 @@ local_rank = None
 
 
 def rank0_print(*args):
-    if local_rank == 0:
+    if local_rank in (None, -1, 0):
         print(*args)
 
 
@@ -453,11 +453,22 @@ class LazySupervisedDataset(Dataset):
         list_data_dict = []
 
         for data in dataset_list:
-            file_format = data["annotation_path"].split(".")[-1]
+            ann_path = str(data["annotation_path"])
+            ann_exists = Path(ann_path).exists()
+            rank0_print(
+                f"[GRU-Data] Loading annotations from {ann_path} (exists={ann_exists})"
+            )
+            if not ann_exists:
+                raise FileNotFoundError(
+                    f"Dataset annotation file not found: {ann_path}. "
+                    f"dataset_use={data_args.dataset_use}"
+                )
+
+            file_format = ann_path.split(".")[-1]
             if file_format == "jsonl":
-                annotations = read_jsonl(data["annotation_path"])
+                annotations = read_jsonl(ann_path)
             else:
-                annotations = json.load(open(data["annotation_path"], "r"))
+                annotations = json.load(open(ann_path, "r"))
             sampling_rate = data.get("sampling_rate", 1.0)
             if sampling_rate < 1.0:
                 annotations = random.sample(

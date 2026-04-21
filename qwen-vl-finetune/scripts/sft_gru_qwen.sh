@@ -17,15 +17,17 @@ MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 MASTER_PORT=${MASTER_PORT:-$(shuf -i 20001-29999 -n 1)}
 NPROC_PER_NODE=${NPROC_PER_NODE:-1}
 
-# Optional DeepSpeed configuration. Set USE_DEEPSPEED=0 to skip it.
-USE_DEEPSPEED=${USE_DEEPSPEED:-1}
+# Optional DeepSpeed configuration. Full GRU-Qwen checkpoint warm-start is not
+# compatible with ZeRO-3's empty partitioned parameters, so keep this off here.
+USE_DEEPSPEED=${USE_DEEPSPEED:-0}
 DEEPSPEED=${DEEPSPEED:-./scripts/zero3.json}
 
 # Model configuration
 MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH:-/home/rithvik/IROS_proj/cvpr_proj/qwen_models/instruct}
+GRU_QWEN_CHECKPOINT_PATH=${GRU_QWEN_CHECKPOINT_PATH:-/home/rithvik/Desktop/allignment_training_copy/output_traj_grounding_simclr/checkpoint-75732}
 
 # GRU-specific configuration
-GRU_CHECKPOINT_PATH=${GRU_CHECKPOINT_PATH:-/home/rithvik/IROS_proj/cvpr_proj/traj_model/checkpoints/best_model.pt}
+GRU_CHECKPOINT_PATH=${GRU_CHECKPOINT_PATH:-}
 PROJECTOR_K=${PROJECTOR_K:-1}
 
 # Training hyperparameters
@@ -40,7 +42,7 @@ LOGGING_STEPS=${LOGGING_STEPS:-10}
 MODEL_MAX_LENGTH=${MODEL_MAX_LENGTH:-8192}
 REPORT_TO=${REPORT_TO:-wandb}
 WANDB_MODE=${WANDB_MODE:-online}
-DATASETS=${DATASETS:-r2r_alignment_qa}
+DATASETS=${DATASETS:-r2r}
 RUN_NAME=${RUN_NAME:-gru-qwen-baseline}
 OUTPUT_DIR=${OUTPUT_DIR:-./output_gru_qwen}
 
@@ -52,7 +54,7 @@ ENTRY_FILE=qwenvl/train/train_gru_qwen.py
 # Build arguments as an array so smoke-test overrides stay easy to read.
 args=(
     --model_name_or_path "${MODEL_NAME_OR_PATH}"
-    --gru_checkpoint_path "${GRU_CHECKPOINT_PATH}"
+    --gru_qwen_checkpoint_path "${GRU_QWEN_CHECKPOINT_PATH}"
     --projector_k "${PROJECTOR_K}"
     --tune_projector True
     --tune_qwen_vision False
@@ -88,6 +90,10 @@ if [[ -n "${MAX_STEPS}" ]]; then
     args+=(--max_steps "${MAX_STEPS}")
 fi
 
+if [[ -n "${GRU_CHECKPOINT_PATH}" ]]; then
+    args+=(--gru_checkpoint_path "${GRU_CHECKPOINT_PATH}")
+fi
+
 if [[ "${USE_DEEPSPEED}" == "1" && -n "${DEEPSPEED}" ]]; then
     args=(--deepspeed "${DEEPSPEED}" "${args[@]}")
 fi
@@ -100,6 +106,7 @@ echo "========================================"
 echo "GRU-Qwen Training"
 echo "========================================"
 echo "Model: ${MODEL_NAME_OR_PATH}"
+echo "GRU-Qwen Checkpoint: ${GRU_QWEN_CHECKPOINT_PATH}"
 echo "GRU Checkpoint: ${GRU_CHECKPOINT_PATH}"
 echo "Dataset: ${DATASETS}"
 echo "Output Dir: ${OUTPUT_DIR}"
