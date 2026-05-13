@@ -10,3 +10,14 @@ __pycache__/
 
 /qwen-vl-finetune/output_gru_qwen_smoke/*
 .gitignrore
+/qwen-vl-finetune/debug/smoke_main_pipeline/*
+/qwen-vl-finetune/debug/smoke_main_pipeline_human/
+/qwen-vl-finetune/debug/smoke_main_pipeline_rxr/
+
+wandb/
+output_gru_qwen/
+output_gru_qwen_unfreeze1_smoke3/
+debug_full_ds_unfreeze1.log
+output_gru_qwen_unfreeze1_smoke4/
+
+qwen-vl-finetune/data_analysis/*.json

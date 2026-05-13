@@ -1,0 +1,673 @@
+import torch
+import torch.nn as nn
+from pathlib import Path
+from typing import Optional, Dict
+
+from qwenvl.models.projector import ProjectorMLP
+from transformers import AutoConfig, AutoModelForCausalLM
+
+
+class TrajectoryGRUEncoder(nn.Module):
+    """Notebook-compatible GRU encoder used for trajectory action features."""
+
+    def __init__(self, input_dim: int = 7, hidden_dim: int = 256, embedding_dim: int = 128):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.embedding_dim = embedding_dim
+        self.gru = nn.GRU(input_dim, hidden_dim, batch_first=True)
+        self.proj = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, embedding_dim),
+        )
+
+    def encode_sequence(self, sequences: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        packed = nn.utils.rnn.pack_padded_sequence(
+            sequences, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+        packed_out, _ = self.gru(packed)
+        padded_out, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True)
+        return padded_out
+
+
+class GRUQwenModel(nn.Module):
+    """
+    Combines GRU trajectory encoder with Qwen VL model via a learned projector.
+    
+        Architecture:
+         action features (B, T, 7) -> frozen notebook GRU (B, T, 256)
+         -> projector MLP (256 -> 1024 -> qwen_hidden)
+         -> prepend projected trajectory tokens to text embeddings
+         -> Qwen LM logits/loss
+    """
+
+    def __init__(self, 
+                 qwen_model_id: str,
+                 gru_checkpoint_path: Optional[str] = None,
+                 projector_k: int = 1,
+                 motion_token_id: Optional[int] = None,
+                 device: str = "cuda",
+                 dtype = None,
+                 tune_qwen_vision: bool = False,
+                 tune_qwen_lm: bool = False,
+                 tune_projector: bool = True,
+                 qwen_lm_unfreeze_last_n_layers: int = 0,
+                 qwen_unfreeze_lm_head: bool = False):
+        """
+        Args:
+            qwen_model_id: HuggingFace model ID for Qwen (e.g., "Qwen/Qwen2.5-VL-7B")
+            gru_checkpoint_path: Path to notebook GRU checkpoint (best_model.pt)
+            projector_k: K value for projector output dimension (K * 4096)
+            device: Device to load models on
+            dtype: Data type for model (torch.float16, torch.bfloat16, etc.)
+            tune_qwen_vision: Whether to train Qwen vision encoder (if applicable)
+            tune_qwen_lm: Whether to train Qwen language model
+            tune_projector: Whether to train projector MLP
+        """
+        super().__init__()
+        
+        self.qwen_model_id = qwen_model_id
+        self.gru_checkpoint_path = gru_checkpoint_path
+        self.projector_k = max(1, int(projector_k))
+        self.device = device
+        self.tune_qwen_vision = tune_qwen_vision
+        self.tune_qwen_lm = tune_qwen_lm
+        self.tune_projector = tune_projector
+        self.qwen_lm_unfreeze_last_n_layers = max(0, int(qwen_lm_unfreeze_last_n_layers))
+        self.qwen_unfreeze_lm_head = qwen_unfreeze_lm_head
+        self.motion_token_id = motion_token_id
+        
+        # Load Qwen model first to derive hidden size.
+        self._load_qwen_model(qwen_model_id, device, dtype)
+
+        # Build notebook-compatible GRU encoder and load frozen checkpoint weights.
+        self.trajectory_gru = TrajectoryGRUEncoder(input_dim=7, hidden_dim=256, embedding_dim=128).to(device)
+        self.gru_checkpoint_meta = {}
+        if gru_checkpoint_path:
+            checkpoint_path = Path(gru_checkpoint_path)
+            if checkpoint_path.exists():
+                ckpt = torch.load(checkpoint_path, map_location=device)
+                state_dict = ckpt.get("model_state_dict", ckpt)
+                missing, unexpected = self.trajectory_gru.load_state_dict(state_dict, strict=False)
+                self.gru_checkpoint_meta = {
+                    "keys": list(ckpt.keys()) if isinstance(ckpt, dict) else [],
+                    "missing": missing,
+                    "unexpected": unexpected,
+                }
+                print(f"[GRU-Qwen] Loaded GRU checkpoint from {checkpoint_path}")
+            else:
+                print(
+                    f"[GRU-Qwen] GRU checkpoint not found at {checkpoint_path}; using randomly initialized encoder"
+                )
+        for param in self.trajectory_gru.parameters():
+            param.requires_grad = False
+        self.trajectory_gru.eval()
+
+        qwen_hidden_dim = self._infer_qwen_hidden_dim()
+        
+        # Project GRU hidden states into Qwen token embedding space.
+        self.projector = ProjectorMLP(
+            gru_hidden_dim=self.trajectory_gru.hidden_dim,
+            qwen_hidden_dim=qwen_hidden_dim,
+            intermediate_dim=1024,
+            k=self.projector_k,
+        ).to(device)
+        self._debug_once = False
+        
+        # Set trainable parameters
+        self._set_trainable_parameters()
+
+    def _load_qwen_model(self, model_id: str, device: str, dtype):
+        """Load appropriate Qwen model variant."""
+        config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        
+        # Try different model classes for compatibility
+        model_class = None
+        if "qwen3" in model_id.lower() or getattr(config, "model_type", "") == "qwen3_vl":
+            try:
+                from transformers import Qwen3VLForConditionalGeneration
+                model_class = Qwen3VLForConditionalGeneration
+            except ImportError:
+                pass
+        
+        if model_class is None and "qwen2.5" in model_id.lower():
+            try:
+                from transformers import Qwen2_5_VLForConditionalGeneration
+                model_class = Qwen2_5_VLForConditionalGeneration
+            except ImportError:
+                pass
+        
+        if model_class is None:
+            try:
+                from transformers import Qwen2VLForConditionalGeneration
+                model_class = Qwen2VLForConditionalGeneration
+            except ImportError:
+                model_class = AutoModelForCausalLM
+        
+        # Load with dtype casting
+        kwargs = {"trust_remote_code": True}
+        if dtype is not None:
+            kwargs["torch_dtype"] = dtype
+        
+        self.qwen = model_class.from_pretrained(model_id, **kwargs).to(device)
+
+    def _infer_qwen_hidden_dim(self) -> int:
+        """Infer the language embedding width across Qwen VL config variants."""
+        config_candidates = [
+            getattr(self.qwen, "config", None),
+            getattr(getattr(self.qwen, "config", None), "text_config", None),
+            getattr(getattr(self.qwen, "config", None), "llm_config", None),
+            getattr(getattr(self.qwen, "config", None), "language_config", None),
+        ]
+        for config in config_candidates:
+            hidden_size = getattr(config, "hidden_size", None)
+            if hidden_size is not None:
+                return int(hidden_size)
+
+        embedding_candidates = [
+            self.qwen.get_input_embeddings() if hasattr(self.qwen, "get_input_embeddings") else None,
+            getattr(getattr(self.qwen, "model", None), "language_model", None),
+            getattr(getattr(getattr(self.qwen, "model", None), "language_model", None), "embed_tokens", None),
+        ]
+        for embedding in embedding_candidates:
+            if embedding is None:
+                continue
+            if hasattr(embedding, "get_input_embeddings"):
+                embedding = embedding.get_input_embeddings()
+            weight = getattr(embedding, "weight", None)
+            if weight is not None and getattr(weight, "ndim", 0) >= 2:
+                return int(weight.shape[-1])
+
+        raise RuntimeError("Could not infer Qwen language hidden size for GRU projector")
+
+    def load_gru_qwen_checkpoint(self, checkpoint_path: str, strict: bool = False) -> Dict[str, list]:
+        """Load a Trainer-saved GRU-Qwen wrapper checkpoint."""
+        path = Path(checkpoint_path)
+        if path.is_dir():
+            path = path / "model.safetensors"
+        if not path.exists():
+            raise FileNotFoundError(f"GRU-Qwen checkpoint not found: {path}")
+
+        if path.suffix == ".safetensors":
+            try:
+                from safetensors.torch import load_file
+            except ImportError as exc:
+                raise ImportError(
+                    "Loading GRU-Qwen .safetensors checkpoints requires the safetensors package."
+                ) from exc
+            # Stage on CPU to avoid a second full Qwen copy on GPU during warm-start.
+            state_dict = load_file(str(path), device="cpu")
+        else:
+            checkpoint = torch.load(path, map_location="cpu")
+            state_dict = checkpoint.get("model_state_dict", checkpoint)
+
+        current_state = self.state_dict()
+        compatible_state = {}
+        mismatched = []
+        for key, value in state_dict.items():
+            current_value = current_state.get(key)
+            if current_value is not None and tuple(current_value.shape) != tuple(value.shape):
+                mismatched.append((key, tuple(value.shape), tuple(current_value.shape)))
+                continue
+            compatible_state[key] = value
+
+        missing, unexpected = self.load_state_dict(compatible_state, strict=strict)
+        del state_dict
+        del compatible_state
+        if "checkpoint" in locals():
+            del checkpoint
+        print(
+            f"[GRU-Qwen] Loaded GRU-Qwen checkpoint from {path} "
+            f"(missing={len(missing)}, unexpected={len(unexpected)}, "
+            f"mismatched_skipped={len(mismatched)}, strict={strict})"
+        )
+        if mismatched:
+            preview = ", ".join(
+                f"{key}: ckpt{src}->model{dst}" for key, src, dst in mismatched[:5]
+            )
+            print(f"[GRU-Qwen] Skipped mismatched checkpoint tensors: {preview}")
+        return {
+            "missing": list(missing),
+            "unexpected": list(unexpected),
+            "mismatched": mismatched,
+        }
+
+    def load_alignment_modules_from_checkpoint(
+        self, checkpoint_path: str, strict: bool = False
+    ) -> Dict[str, list]:
+        """
+        Load only alignment modules (trajectory_gru + projector) from a GRU-Qwen
+        Trainer checkpoint and intentionally skip all Qwen backbone weights.
+
+        This is useful when DeepSpeed ZeRO-3 is enabled and we want a lightweight
+        warm-start without loading a full wrapper state dict.
+        """
+        path = Path(checkpoint_path)
+        if path.is_dir():
+            safetensor_path = path / "model.safetensors"
+            if safetensor_path.exists():
+                path = safetensor_path
+            else:
+                raise FileNotFoundError(
+                    f"No model.safetensors found under alignment checkpoint dir: {checkpoint_path}"
+                )
+        if not path.exists():
+            raise FileNotFoundError(f"Alignment checkpoint not found: {path}")
+
+        if path.suffix == ".safetensors":
+            try:
+                from safetensors.torch import load_file
+            except ImportError as exc:
+                raise ImportError(
+                    "Loading alignment .safetensors checkpoints requires the safetensors package."
+                ) from exc
+            state_dict = load_file(str(path), device="cpu")
+        else:
+            checkpoint = torch.load(path, map_location="cpu")
+            state_dict = checkpoint.get("model_state_dict", checkpoint)
+
+        keep_prefixes = ("trajectory_gru.", "projector.")
+        module_state = {
+            key: value
+            for key, value in state_dict.items()
+            if any(key.startswith(prefix) for prefix in keep_prefixes)
+        }
+        if len(module_state) == 0:
+            raise RuntimeError(
+                "No trajectory_gru/projector weights found in checkpoint. "
+                f"Expected prefixes: {keep_prefixes}"
+            )
+
+        current_state = self.state_dict()
+        compatible_state = {}
+        mismatched = []
+        for key, value in module_state.items():
+            current_value = current_state.get(key)
+            if current_value is not None and tuple(current_value.shape) != tuple(value.shape):
+                mismatched.append((key, tuple(value.shape), tuple(current_value.shape)))
+                continue
+            compatible_state[key] = value
+
+        missing, unexpected = self.load_state_dict(compatible_state, strict=strict)
+        del state_dict
+        del module_state
+        del compatible_state
+        if "checkpoint" in locals():
+            del checkpoint
+
+        loaded_gru = sum(1 for k in current_state.keys() if k.startswith("trajectory_gru.") and k not in missing)
+        loaded_projector = sum(1 for k in current_state.keys() if k.startswith("projector.") and k not in missing)
+        print(
+            f"[GRU-Qwen] Loaded alignment modules from {path} "
+            f"(gru_keys_loaded={loaded_gru}, projector_keys_loaded={loaded_projector}, "
+            f"missing={len(missing)}, unexpected={len(unexpected)}, "
+            f"mismatched_skipped={len(mismatched)}, strict={strict})"
+        )
+        if mismatched:
+            preview = ", ".join(
+                f"{key}: ckpt{src}->model{dst}" for key, src, dst in mismatched[:5]
+            )
+            print(f"[GRU-Qwen] Skipped mismatched alignment tensors: {preview}")
+
+        return {
+            "missing": list(missing),
+            "unexpected": list(unexpected),
+            "mismatched": mismatched,
+        }
+
+    @staticmethod
+    def checkpoint_vocab_size(checkpoint_path: str) -> Optional[int]:
+        """Return checkpoint embedding rows without materializing tensors."""
+        path = Path(checkpoint_path)
+        if path.is_dir():
+            path = path / "model.safetensors"
+        if not path.exists() or path.suffix != ".safetensors":
+            return None
+
+        import json
+        import struct
+
+        with path.open("rb") as handle:
+            header_size = struct.unpack("<Q", handle.read(8))[0]
+            header = json.loads(handle.read(header_size))
+
+        for key in (
+            "qwen.model.language_model.embed_tokens.weight",
+            "qwen.model.embed_tokens.weight",
+            "qwen.lm_head.weight",
+        ):
+            shape = header.get(key, {}).get("shape")
+            if shape and len(shape) >= 2:
+                return int(shape[0])
+        return None
+
+    def _get_qwen_language_model(self):
+        if hasattr(self.qwen, "language_model"):
+            return self.qwen.language_model
+        model_obj = getattr(self.qwen, "model", None)
+        if model_obj is not None and hasattr(model_obj, "language_model"):
+            return model_obj.language_model
+        return None
+
+    def _set_trainable_parameters(self):
+        """Configure which parameters should be trained."""
+        # Freeze Qwen entirely by default.
+        for param in self.qwen.parameters():
+            param.requires_grad = False
+        
+        # Unfreeze vision encoder if requested
+        if self.tune_qwen_vision and hasattr(self.qwen, 'visual'):
+            for param in self.qwen.visual.parameters():
+                param.requires_grad = True
+        
+        language_model = self._get_qwen_language_model()
+
+        # Full LM unfreeze.
+        if self.tune_qwen_lm and language_model is not None:
+            for param in language_model.parameters():
+                param.requires_grad = True
+            if hasattr(self.qwen, "lm_head"):
+                for param in self.qwen.lm_head.parameters():
+                    param.requires_grad = True
+
+        # Partial LM unfreeze: last N decoder layers only.
+        if (not self.tune_qwen_lm) and self.qwen_lm_unfreeze_last_n_layers > 0 and language_model is not None:
+            layers = getattr(language_model, "layers", None)
+            if layers is not None and len(layers) > 0:
+                n = min(self.qwen_lm_unfreeze_last_n_layers, len(layers))
+                for layer in layers[-n:]:
+                    for param in layer.parameters():
+                        param.requires_grad = True
+                # also unfreeze final norm for stability in partial LM tuning
+                final_norm = getattr(language_model, "norm", None)
+                if final_norm is not None:
+                    for param in final_norm.parameters():
+                        param.requires_grad = True
+                lm_trainable = sum(
+                    p.numel() for p in language_model.parameters() if p.requires_grad
+                )
+                print(
+                    f"[GRU-Qwen] Partially unfroze Qwen LM last {n} layer(s) + final norm "
+                    f"(lm_trainable_params={lm_trainable:,})"
+                )
+            if self.qwen_unfreeze_lm_head and hasattr(self.qwen, "lm_head"):
+                for param in self.qwen.lm_head.parameters():
+                    param.requires_grad = True
+                print("[GRU-Qwen] Unfroze Qwen lm_head")
+        
+        # Projector is trainable by default
+        if not self.tune_projector:
+            for param in self.projector.parameters():
+                param.requires_grad = False
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """Proxy HF Trainer gradient-checkpointing calls to the underlying Qwen model."""
+        if hasattr(self.qwen, "gradient_checkpointing_enable"):
+            self.qwen.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
+            )
+
+    def gradient_checkpointing_disable(self):
+        """Proxy HF Trainer gradient-checkpointing disable calls to the underlying Qwen model."""
+        if hasattr(self.qwen, "gradient_checkpointing_disable"):
+            self.qwen.gradient_checkpointing_disable()
+
+    def forward(self,
+                gru_features: torch.Tensor,
+                gru_lengths: torch.Tensor,
+                input_ids: Optional[torch.Tensor] = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                pixel_values: Optional[torch.Tensor] = None,
+                image_grid_thw: Optional[torch.Tensor] = None,
+                pixel_values_videos: Optional[torch.Tensor] = None,
+                video_grid_thw: Optional[torch.Tensor] = None,
+                labels: Optional[torch.Tensor] = None,
+                **kwargs):
+        """
+        Forward pass through GRU-Qwen model.
+        
+        Args:
+            gru_features: Trajectory features, either (batch_size, traj_seq_len, 7)
+                or per-slot prefixes (batch_size, num_slots, prefix_len, 7)
+            gru_lengths: Valid lengths matching gru_features shape, either (batch_size,)
+                or per-slot lengths (batch_size, num_slots)
+            input_ids: Text token IDs (batch_size, text_seq_len)
+            attention_mask: Attention mask for text tokens (batch_size, text_seq_len)
+            pixel_values: Vision input (for multimodal Qwen models)
+            image_grid_thw: Image grid info (for some Qwen variants)
+            labels: Target token IDs for loss computation (optional)
+            
+        Returns:
+            Dict with loss/logits for Trainer compatibility
+        """
+        if gru_features is None or gru_lengths is None:
+            raise ValueError("gru_features and gru_lengths are required for GRU-Qwen training")
+
+        gru_features = gru_features.to(self.device)
+        gru_lengths = gru_lengths.to(self.device)
+        if input_ids is not None:
+            input_ids = input_ids.to(self.device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.device)
+        if labels is not None:
+            labels = labels.to(self.device)
+        
+        if gru_features.dim() == 4:
+            bsz, num_slots, max_t, feat_dim = gru_features.shape
+            flat_features = gru_features.reshape(bsz * num_slots, max_t, feat_dim)
+            flat_lengths = gru_lengths.reshape(bsz * num_slots)
+            flat_lengths = flat_lengths.clamp(min=1, max=max_t)
+
+            # Frozen GRU encoder.
+            with torch.no_grad():
+                flat_hidden = self.trajectory_gru.encode_sequence(flat_features, flat_lengths)
+            flat_last_idx = (flat_lengths - 1).to(dtype=torch.long)
+            flat_last = flat_hidden[
+                torch.arange(flat_hidden.shape[0], device=flat_hidden.device),
+                flat_last_idx,
+                :,
+            ]
+
+            # Trainable projector must run with grad enabled.
+            projected = self.projector(flat_last).reshape(bsz, num_slots, -1)
+            gru_hidden = flat_hidden.reshape(bsz, num_slots, max_t, -1)
+        else:
+            # Frozen GRU encoder.
+            with torch.no_grad():
+                gru_hidden = self.trajectory_gru.encode_sequence(gru_features, gru_lengths)
+            # Trainable projector must run with grad enabled.
+            projected = self.projector(gru_hidden)
+
+        if input_ids is not None:
+            input_embeds = self.qwen.get_input_embeddings()(input_ids)
+            projected = projected.to(dtype=input_embeds.dtype, device=input_embeds.device)
+        else:
+            input_embeds = None
+
+        labels_for_model = labels.clone() if labels is not None else None
+
+        if input_embeds is not None:
+            combined_attention = attention_mask if attention_mask is not None else torch.ones(
+                input_embeds.shape[:2], device=self.device, dtype=torch.long
+            )
+
+            placement_stats = []
+            aligned_rows = []
+            mask_rows = []
+            for b in range(input_embeds.shape[0]):
+                if gru_lengths.dim() == 2:
+                    seq_len = int((gru_lengths[b] > 0).sum().item())
+                else:
+                    seq_len = int(gru_lengths[b].item())
+                seq_len = max(1, min(seq_len, projected.shape[1]))
+
+                if self.motion_token_id is not None and self.motion_token_id >= 0:
+                    motion_positions = (input_ids[b] == int(self.motion_token_id)).nonzero(as_tuple=False).squeeze(-1)
+                else:
+                    motion_positions = torch.empty(0, dtype=torch.long, device=input_ids.device)
+
+                if motion_positions.numel() == 0:
+                    valid_positions = (
+                        combined_attention[b].nonzero(as_tuple=False).squeeze(-1)
+                        if combined_attention is not None
+                        else torch.arange(input_embeds.shape[1], device=input_embeds.device)
+                    )
+                    motion_positions = valid_positions[:seq_len]
+
+                row_aligned = torch.zeros_like(input_embeds[b])
+                row_mask = torch.zeros(
+                    (input_embeds.shape[1], 1),
+                    device=input_embeds.device,
+                    dtype=input_embeds.dtype,
+                )
+                use_n = min(int(motion_positions.numel()), seq_len)
+                if use_n > 0:
+                    use_pos = motion_positions[:use_n]
+                    row_aligned = row_aligned.index_copy(0, use_pos, projected[b, :use_n, :])
+                    row_mask = row_mask.index_fill(0, use_pos, 1.0)
+                    if labels_for_model is not None:
+                        labels_for_model[b, use_pos] = -100
+
+                aligned_rows.append(row_aligned)
+                mask_rows.append(row_mask)
+                placement_stats.append((int(motion_positions.numel()), use_n, seq_len))
+
+            aligned_projected = torch.stack(aligned_rows, dim=0)
+            inject_mask = torch.stack(mask_rows, dim=0)
+            combined_embeds = input_embeds * (1.0 - inject_mask) + aligned_projected * inject_mask
+        else:
+            combined_embeds = projected
+            combined_attention = torch.ones(
+                projected.shape[:2], device=self.device, dtype=torch.long
+            )
+        
+        model_kwargs = {
+            "inputs_embeds": combined_embeds,
+            "attention_mask": combined_attention,
+        }
+        
+        if labels_for_model is not None:
+            model_kwargs["labels"] = labels_for_model
+        
+        if pixel_values is not None:
+            model_kwargs["pixel_values"] = pixel_values
+        if image_grid_thw is not None:
+            model_kwargs["image_grid_thw"] = image_grid_thw
+        if pixel_values_videos is not None:
+            model_kwargs["pixel_values_videos"] = pixel_values_videos
+        if video_grid_thw is not None:
+            model_kwargs["video_grid_thw"] = video_grid_thw
+
+        if not self._debug_once:
+            print(
+                f"[GRU-Qwen][debug] batch gru_features={tuple(gru_features.shape)} "
+                f"gru_hidden={tuple(gru_hidden.shape)} projected={tuple(projected.shape)}"
+            )
+            if input_ids is not None:
+                print(f"[GRU-Qwen][debug] motion_token_id={self.motion_token_id}")
+                print(f"[GRU-Qwen][debug] placement_stats=(found,use,gru_len) {placement_stats}")
+                print(f"[GRU-Qwen][debug] input_ids shape={tuple(input_ids.shape)}")
+                print(f"[GRU-Qwen][debug] combined_embeds shape={tuple(combined_embeds.shape)}")
+        
+        outputs = self.qwen(**model_kwargs)
+
+        loss = outputs.loss if hasattr(outputs, "loss") else None
+        if loss is None:
+            raise RuntimeError(
+                "[GRU-Qwen] Qwen forward returned no loss. "
+                "Ensure labels contain supervised tokens (not all -100)."
+            )
+        if isinstance(loss, torch.Tensor) and loss.ndim > 0:
+            loss = loss.mean()
+
+        if not self._debug_once and hasattr(outputs, "logits"):
+            print(f"[GRU-Qwen][debug] logits shape={tuple(outputs.logits.shape)}")
+            if isinstance(loss, torch.Tensor):
+                print(f"[GRU-Qwen][debug] loss shape={tuple(loss.shape)}")
+            self._debug_once = True
+        
+        return {
+            "loss": loss,
+            "logits": outputs.logits if hasattr(outputs, "logits") else None,
+            "hidden_states": outputs.hidden_states if hasattr(outputs, "hidden_states") else None,
+            "attentions": outputs.attentions if hasattr(outputs, "attentions") else None,
+        }
+
+    def get_trainable_params_count(self) -> Dict[str, int]:
+        """Return total and trainable parameter counts for all major modules."""
+        def _param_size(p):
+            # ZeRO-3 can expose local partition tensors with numel()==0 during init.
+            # ds_numel keeps the global logical size when available.
+            return int(getattr(p, "ds_numel", p.numel()))
+
+        qwen_total = sum(_param_size(p) for p in self.qwen.parameters())
+        qwen_trainable = sum(_param_size(p) for p in self.qwen.parameters() if p.requires_grad)
+
+        gru_total = sum(_param_size(p) for p in self.trajectory_gru.parameters())
+        gru_trainable = sum(
+            _param_size(p) for p in self.trajectory_gru.parameters() if p.requires_grad
+        )
+
+        projector_total = sum(_param_size(p) for p in self.projector.parameters())
+        projector_trainable = sum(
+            _param_size(p) for p in self.projector.parameters() if p.requires_grad
+        )
+
+        total_params = qwen_total + gru_total + projector_total
+        total_trainable = qwen_trainable + gru_trainable + projector_trainable
+
+        return {
+            "qwen_total": qwen_total,
+            "qwen_trainable": qwen_trainable,
+            "trajectory_gru_total": gru_total,
+            "trajectory_gru_trainable": gru_trainable,
+            "projector_total": projector_total,
+            "projector_trainable": projector_trainable,
+            "total_params": total_params,
+            "total_trainable": total_trainable,
+        }
+
+    def validate_alignment_setup(self, strict: bool = True) -> Dict[str, int]:
+        """Validate module freezing expectations for alignment-style training."""
+        stats = self.get_trainable_params_count()
+
+        expects_qwen_frozen = not (self.tune_qwen_lm or self.tune_qwen_vision)
+        if expects_qwen_frozen and stats["qwen_trainable"] != 0 and strict:
+            raise RuntimeError(
+                "Alignment validation failed: Qwen should be frozen but has "
+                f"{stats['qwen_trainable']:,} trainable params"
+            )
+
+        if self.tune_projector and stats["projector_trainable"] <= 0 and strict:
+            raise RuntimeError(
+                "Alignment validation failed: projector is expected trainable but has 0 trainable params"
+            )
+
+        if stats["trajectory_gru_trainable"] != 0 and strict:
+            raise RuntimeError(
+                "Alignment validation failed: trajectory GRU is expected frozen but has "
+                f"{stats['trajectory_gru_trainable']:,} trainable params"
+            )
+
+        return stats
+
+    def print_trainable_parameters(self):
+        """Print summary of trainable parameters."""
+        counts = self.get_trainable_params_count()
+
+        print("\n[GRU-Qwen] Trainable Parameters:")
+        print(
+            f"  - qwen: total={counts['qwen_total']:,} trainable={counts['qwen_trainable']:,}"
+        )
+        print(
+            "  - trajectory_gru: "
+            f"total={counts['trajectory_gru_total']:,} "
+            f"trainable={counts['trajectory_gru_trainable']:,}"
+        )
+        print(
+            f"  - projector: total={counts['projector_total']:,} trainable={counts['projector_trainable']:,}"
+        )
+        print(
+            f"  - all_modules: total={counts['total_params']:,} trainable={counts['total_trainable']:,}\n"
+        )
