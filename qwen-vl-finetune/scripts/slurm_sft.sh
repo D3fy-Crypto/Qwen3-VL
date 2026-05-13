@@ -3,7 +3,7 @@
 #SBATCH --partition=a100
 #SBATCH --gres=gpu:a100:4
 #SBATCH --cpus-per-task=40
-#SBATCH --mem=64G
+#SBATCH --mem=256G
 #SBATCH --time=3-00:00:00
 #SBATCH --account=tinoosh
 #SBATCH --output=/scratch/tinoosh/chang/logs/%j_%x.out

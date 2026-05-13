@@ -1,10 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=qwen3vl_sft_gru
-#SBATCH --partition=l40s
-#SBATCH --gres=gpu:l40s:8
-#SBATCH --cpus-per-task=64
+#SBATCH --partition=a100
+#SBATCH --gres=gpu:a100:4
+#SBATCH --cpus-per-task=40
 #SBATCH --mem=256G
-#SBATCH --time=24:00:00
+#SBATCH --time=3-00:00:00
+#SBATCH --account=tinoosh
 #SBATCH --output=/scratch/tinoosh/chang/logs/%j_%x.out
 #SBATCH --error=/scratch/tinoosh/chang/logs/%j_%x.err
 #SBATCH --nodes=1
@@ -13,42 +14,42 @@
 # ============================================================
 # Configurable — edit these before submitting
 # ============================================================
-MODEL_PATH="/weka/scratch/tinoosh/iros_dataset/Qwen-Model/instruct"
-GRU_WARMSTART="/weka/scratch/tinoosh/iros_dataset/Qwen-Model/gru_ckpt/model.safetensors"
-DATASETS="human"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+MODEL_PATH="/home/djonna1/scratchtinoosh/iros_dataset/Qwen-Model/instruct"
+GRU_QWEN_CKPT="/home/djonna1/scratchtinoosh/iros_dataset/Qwen-Model/gru_ckpt"
+DATASETS="r2r,human,rxr,scanqa"
 RUN_NAME="qwen3vl-gru-sft-$(date +%Y%m%d-%H%M)"
 OUTPUT_DIR="/scratch/tinoosh/chang/checkpoints/${RUN_NAME}"
 WANDB_PROJECT="qwen3vl-gru-sft"
 
 LR=1e-4
-BATCH_SIZE=2
-GRAD_ACCUM=8
+BATCH_SIZE=4
+GRAD_ACCUM=10
 EPOCHS=1
 MODEL_MAX_LENGTH=8192   # longer context for long-horizon trajectories
-
 if [[ "${SMOKE:-0}" == "1" ]]; then
-    BATCH_SIZE=2
+    BATCH_SIZE=1
     GRAD_ACCUM=2
-    NPROC_OVERRIDE=2
+    NPROC_OVERRIDE=1
     MODEL_MAX_LENGTH=2048
     MAX_STEPS_ARG="--max_steps 10"
-    SAVE_STRATEGY_ARG="--save_strategy steps --save_steps 500 --save_total_limit 2"
-    REPORT_ARG="--report_to none"
-    TUNE_LLM_ARG="--tune_mm_llm False --tune_qwen_lm False"
+    SAVE_STRATEGY_ARG="--save_strategy steps --save_steps 50 --save_total_limit 2"
+    REPORT_ARG="--report_to wandb"
+    TUNE_LLM_ARG="--tune_qwen_lm False"
     PIXELS_ARG="--max_pixels 4096 --min_pixels 784"
     WORKERS_ARG="--dataloader_num_workers 4"
     DEEPSPEED_ARG="--deepspeed ./scripts/zero3.json"
     RUN_NAME="smoke-gru-$(date +%Y%m%d-%H%M)"
     OUTPUT_DIR="/scratch/tinoosh/chang/checkpoints/${RUN_NAME}"
-    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 else
-    NPROC_OVERRIDE=8
+    NPROC_OVERRIDE=4
     MAX_STEPS_ARG=""
     SAVE_STRATEGY_ARG="--save_strategy steps --save_steps 500 --save_total_limit 2"
     REPORT_ARG="--report_to wandb"
-    TUNE_LLM_ARG="--tune_mm_llm True --tune_qwen_lm True"
+    TUNE_LLM_ARG="--tune_qwen_lm True"
     PIXELS_ARG="--max_pixels 50176 --min_pixels 784"
-    WORKERS_ARG="--dataloader_num_workers 4"
+    WORKERS_ARG="--dataloader_num_workers 8"
     DEEPSPEED_ARG="--deepspeed ./scripts/zero3.json"
 fi
 # ============================================================
@@ -74,33 +75,33 @@ export WANDB_PROJECT="${WANDB_PROJECT}"
 export WANDB_RUN_ID="${RUN_NAME}"
 
 echo "========================================"
-echo "Job ID      : ${SLURM_JOB_ID}"
-echo "Node        : ${SLURM_NODELIST}"
-echo "Model       : ${MODEL_PATH}"
-echo "Warmstart   : ${GRU_WARMSTART}"
-echo "Dataset     : ${DATASETS}"
-echo "Output Dir  : ${OUTPUT_DIR}"
-echo "Run Name    : ${RUN_NAME}"
-echo "GPUs/node   : ${NPROC_PER_NODE}"
-echo "LR          : ${LR}"
-echo "Batch/GPU   : ${BATCH_SIZE}  (effective: $((BATCH_SIZE * GRAD_ACCUM * NPROC_PER_NODE)))"
+echo "Job ID       : ${SLURM_JOB_ID}"
+echo "Node         : ${SLURM_NODELIST}"
+echo "Model        : ${MODEL_PATH}"
+echo "GRU-Qwen Ckpt: ${GRU_QWEN_CKPT}"
+echo "Dataset      : ${DATASETS}"
+echo "Output Dir   : ${OUTPUT_DIR}"
+echo "Run Name     : ${RUN_NAME}"
+echo "GPUs/node    : ${NPROC_PER_NODE}"
+echo "LR           : ${LR}"
+echo "Batch/GPU    : ${BATCH_SIZE}  (effective: $((BATCH_SIZE * GRAD_ACCUM * NPROC_PER_NODE)))"
 echo "========================================"
 
 torchrun \
     --nproc_per_node=${NPROC_PER_NODE} \
     --master_addr=${MASTER_ADDR} \
     --master_port=${MASTER_PORT} \
-    qwenvl/train/train_gru_sft_qwen.py \
+    qwenvl/train/train_gru_qwen.py \
         ${DEEPSPEED_ARG} \
         --model_name_or_path "${MODEL_PATH}" \
-        --gru_warmstart_ckpt "${GRU_WARMSTART}" \
+        --gru_qwen_checkpoint_path "${GRU_QWEN_CKPT}" \
+        --projector_k "${PROJECTOR_K:-1}"\
         --model_type qwen3vl \
         --dataset_use "${DATASETS}" \
-        --tune_mm_vision True \
-        --tune_mm_mlp True \
-        ${TUNE_LLM_ARG} \
+        --data_flatten False \
         --tune_projector True \
-        --tune_qwen_vision False \
+        --tune_qwen_vision True \
+        ${TUNE_LLM_ARG} \
         --bf16 \
         --output_dir "${OUTPUT_DIR}" \
         --num_train_epochs ${EPOCHS} \
@@ -110,8 +111,8 @@ torchrun \
         --eval_strategy no \
         ${SAVE_STRATEGY_ARG} \
         --learning_rate ${LR} \
-        --weight_decay 0 \
-        --warmup_ratio 0.03 \
+        --weight_decay 0.01 \
+        --warmup_ratio 0.05 \
         --max_grad_norm 1 \
         --lr_scheduler_type cosine \
         --logging_steps 10 \

@@ -635,47 +635,31 @@ class LazySupervisedDataset(Dataset):
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         num_base_retries = 3
-        num_final_retries = 30
 
-        # try the current sample first
+        # missing file: skip forward immediately, no sleep
+        next_index = i
+        for _ in range(num_base_retries):
+            try:
+                sources = self.list_data_dict[next_index]
+                if isinstance(sources, dict):
+                    sources = [sources]
+                return self.item_fn(sources)
+            except FileNotFoundError as e:
+                print(f"[Skip] Missing file for sample {next_index}, trying next. {e}")
+                next_index = min(next_index + 1, len(self.list_data_dict) - 1)
+
+        # transient error: retry current sample with sleep
         for attempt_idx in range(num_base_retries):
             try:
                 sources = self.list_data_dict[i]
                 if isinstance(sources, dict):
                     sources = [sources]
-                sample = self.item_fn(sources)
-                return sample
+                return self.item_fn(sources)
             except Exception as e:
-                # sleep 1s in case it is a cloud disk issue
                 print(f"[Try #{attempt_idx}] Failed to fetch sample {i}. Exception:", e)
                 time.sleep(1)
 
-        # try other samples, in case it is file corruption issue
-        for attempt_idx in range(num_base_retries):
-            try:
-                next_index = min(i + 1, len(self.list_data_dict) - 1)
-                sources = self.list_data_dict[next_index]
-                if isinstance(sources, dict):
-                    sources = [sources]
-
-                sample = self.item_fn(sources)
-                return sample
-            except Exception as e:
-                # no need to sleep
-                print(
-                    f"[Try other #{attempt_idx}] Failed to fetch sample {next_index}. Exception:",
-                    e,
-                )
-                pass
-
-        try:
-            sources = self.list_data_dict[i]
-            if isinstance(sources, dict):
-                sources = [sources]
-            sample = self.item_fn(sources)
-            return sample
-        except Exception as e:
-            raise e
+        raise RuntimeError(f"Failed to fetch any valid sample after retries, last index {i}.")
 
     def _get_item(self, sources) -> Dict[str, torch.Tensor]:
         source_item = sources[0] if isinstance(sources, list) and len(sources) > 0 else {}

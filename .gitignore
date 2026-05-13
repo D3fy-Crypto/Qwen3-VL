@@ -7,6 +7,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+**/wandb/*
 
 /qwen-vl-finetune/output_gru_qwen_smoke/*
 .gitignrore
@@ -21,3 +22,5 @@ debug_full_ds_unfreeze1.log
 output_gru_qwen_unfreeze1_smoke4/
 
 qwen-vl-finetune/data_analysis/*.json
+**.log
+
