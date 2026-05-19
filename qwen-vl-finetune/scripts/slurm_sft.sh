@@ -117,5 +117,6 @@ torchrun \
         --gradient_checkpointing True \
         ${WORKERS_ARG} \
         --run_name "${RUN_NAME}" \
+        --inference_snapshot_steps 100 \
         ${MAX_STEPS_ARG} \
         ${REPORT_ARG}
