@@ -39,9 +39,34 @@ from qwenvl.train.argument import (
     DataArguments,
     TrainingArguments,
 )
-from transformers import AutoProcessor, Trainer
+from transformers import AutoProcessor, Trainer, TrainerCallback
 
 local_rank = None
+
+
+class InferenceSnapshotCallback(TrainerCallback):
+    """Saves inference-only model weights every N optimizer steps.
+
+    Writes output_dir/inference-step-{N:06d}/model.safetensors (+ config.json).
+    Optimizer and scheduler state are NOT saved. Works with DeepSpeed ZeRO.
+    """
+
+    def __init__(self, output_dir: str, every_n_steps: int = 100):
+        self.output_dir = output_dir
+        self.every_n_steps = every_n_steps
+        self._trainer = None
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self.every_n_steps <= 0:
+            return
+        if state.global_step == 0 or state.global_step % self.every_n_steps != 0:
+            return
+        if self._trainer is None:
+            return
+        snapshot_dir = os.path.join(self.output_dir, f"inference-step-{state.global_step:06d}")
+        self._trainer.save_model(snapshot_dir)
+        if args.should_save:
+            print(f"[InferenceSnapshot] step {state.global_step} -> {snapshot_dir}", flush=True)
 
 
 def rank0_print(*args):
@@ -192,9 +217,16 @@ def train(attn_implementation="flash_attention_2"):
             model.model.print_trainable_parameters()
     
     data_module = make_supervised_data_module(processor, data_args=data_args)
-    trainer = Trainer(
-        model=model, processing_class=tokenizer, args=training_args, **data_module
+    snapshot_cb = InferenceSnapshotCallback(
+        output_dir=training_args.output_dir,
+        every_n_steps=training_args.inference_snapshot_steps,
     )
+    trainer = Trainer(
+        model=model, processing_class=tokenizer, args=training_args,
+        callbacks=[snapshot_cb],
+        **data_module,
+    )
+    snapshot_cb._trainer = trainer
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         logging.info("checkpoint found, resume training")

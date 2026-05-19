@@ -68,8 +68,8 @@ def test_dataset(name, cfg):
 
     data_path = Path(cfg["data_path"])
     try:
-        messages = _build_messages(item, data_path)
-        print(f"  [OK] _build_messages succeeded, {len(messages)} messages")
+        messages, has_missing = _build_messages(item, data_path)
+        print(f"  [OK] _build_messages succeeded, {len(messages)} turns  has_missing={has_missing}")
         summarize_messages(messages)
     except Exception as e:
         print(f"  [FAIL] _build_messages: {e}")

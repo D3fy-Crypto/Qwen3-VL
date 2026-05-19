@@ -153,6 +153,33 @@ def update_processor_pixels(processor, data_args):
 NUM_HISTORICAL_FRAMES = 7
 
 
+def _strip_visual_tokens(text: str) -> str:
+    text = text.replace("<image>", "").replace("<video>", "").replace("<motion>", "")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _normalize_conversations(conversations: List[Dict]) -> List[Dict]:
+    out = []
+    for turn in conversations:
+        speaker = turn.get("from", "")
+        if speaker in {"human", "user"}:
+            out.append({"from": "human", "value": str(turn.get("value", ""))})
+        elif speaker in {"gpt", "assistant"}:
+            out.append({"from": "gpt", "value": str(turn.get("value", ""))})
+    return out
+
+
+def _load_frame_dir(frame_dir: Path, num_frames: int) -> Tuple[List[PILImage.Image], bool]:
+    """Load uniformly sampled frames from a directory of image files."""
+    exts = {".jpeg", ".jpg", ".png"}
+    files = sorted(p for p in frame_dir.iterdir() if p.suffix.lower() in exts)
+    if not files:
+        return [PILImage.new("RGB", (224, 224))] * num_frames, True
+    indices = _sample_frame_indices(len(files), num_frames)
+    frames = [PILImage.open(files[i]).convert("RGB") for i in indices]
+    return frames, False
+
+
 def _sample_frame_indices(total_frames: int, num_frames: int) -> List[int]:
     """Uniformly sample num_frames indices from total_frames.
     Caller is responsible for padding if total_frames < num_frames.
@@ -166,7 +193,14 @@ def _sample_frame_indices(total_frames: int, num_frames: int) -> List[int]:
 def _extract_video_frames(video_path: str, num_frames: int) -> List[PILImage.Image]:
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    indices = _sample_frame_indices(max(total, 1), num_frames)
+    if total == 0:
+        # File not found or unreadable — return sentinel frames so callers can detect it.
+        cap.release()
+        logging.warning(f"Missing or unreadable video: {video_path}, using black frames.")
+        black = PILImage.new("RGB", (224, 224))
+        black.__class__ = _MissingImage
+        return [black] * num_frames
+    indices = _sample_frame_indices(total, num_frames)
     frames = []
     for idx in indices:
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -185,10 +219,68 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> Tuple[List[Dict[st
     system_prompt = "You are a helpful navigation assistant."
     messages = [{"role": "system", "content": [{"type": "text", "text": system_prompt}]}]
 
-    # ScanQA format: video_id + q + a (list), no frames key
+    # ShareGPT4V / ShareGPTVideo: LLaVA-style multi-turn conversations format
+    if "conversations" in item:
+        turns = _normalize_conversations(item["conversations"])
+        images: List[PILImage.Image] = []
+        has_missing = False
+
+        if "image" in item:
+            # ShareGPT4V — single image or list of image paths
+            image_files = item["image"] if isinstance(item["image"], list) else [item["image"]]
+            for img_file in image_files:
+                img_path = base_path / img_file
+                try:
+                    images.append(PILImage.open(img_path).convert("RGB"))
+                except FileNotFoundError:
+                    logging.warning(f"Missing image: {img_path}, using black frame.")
+                    black = PILImage.new("RGB", (224, 224))
+                    black.__class__ = _MissingImage
+                    images.append(black)
+                    has_missing = True
+        elif "video" in item:
+            # ShareGPTVideo — frames pre-extracted in frames/{video}/ directory
+            frame_dir = base_path / item["video"]
+            images, has_missing = _load_frame_dir(frame_dir, NUM_HISTORICAL_FRAMES + 1)
+
+        for i, turn in enumerate(turns):
+            role = "user" if turn["from"] == "human" else "assistant"
+            value = turn["value"]
+            if role == "assistant":
+                content = [{"type": "text", "text": value}]
+            elif i == 0:
+                # First user turn: strip visual tokens and prepend all images
+                clean = _strip_visual_tokens(value)
+                content = [{"type": "image", "image": img} for img in images]
+                content.append({"type": "text", "text": clean})
+            else:
+                content = [{"type": "text", "text": _strip_visual_tokens(value)}]
+            messages.append({"role": role, "content": content})
+
+        return messages, has_missing
+
     if "frames" not in item:
+        # EnvDrop format: {video_id (int), instruction}
+        # video filename = video_id directly  (e.g. video_id=1 -> 1.mp4)
+        if "instruction" in item and "q" not in item:
+            video_path = str((base_path / f"{item['video_id']}.mp4").resolve())
+            pil_frames = _extract_video_frames(video_path, NUM_HISTORICAL_FRAMES + 1)
+            has_missing = any(isinstance(f, _MissingImage) for f in pil_frames)
+            content = [
+                {"type": "text", "text": "Assume you are a robot designed for navigation. "
+                    "You are provided with captured images sequences"},
+                *[{"type": "image", "image": f} for f in pil_frames],
+                {"type": "text", "text": ". Based on this image sequence, please describe "
+                    "the navigation trajectory of the robot."},
+            ]
+            messages.append({"role": "user", "content": content})
+            messages.append({"role": "assistant", "content": [{"type": "text", "text": item["instruction"]}]})
+            return messages, has_missing
+
+        # ScanQA / Video-ChatGPT format: video_id + q + a (list), no frames key
         video_path = str((base_path / f"{item['video_id']}.mp4").resolve())
         pil_frames = _extract_video_frames(video_path, NUM_HISTORICAL_FRAMES + 1)
+        has_missing = any(isinstance(f, _MissingImage) for f in pil_frames)
         answer = random.choice(item["a"]) if isinstance(item["a"], list) else item["a"]
         content = [
             *[{"type": "image", "image": f} for f in pil_frames],
@@ -196,7 +288,7 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> Tuple[List[Dict[st
         ]
         messages.append({"role": "user", "content": content})
         messages.append({"role": "assistant", "content": [{"type": "text", "text": answer}]})
-        return messages, False
+        return messages, has_missing
 
     frames = item["frames"]
     if len(frames) < 1:
@@ -241,8 +333,13 @@ def preprocess_qwen_visual(
 
     source = sources[0]
     base_path = Path(source.get("data_path", ""))
+
+    # Build the multi-turn message list and load PIL images.
+    # has_missing=True means at least one image file was not found on disk.
     messages, has_missing = _build_messages(source, base_path)
 
+    # Tokenize the full conversation (system + user + assistant turns).
+    # Returns input_ids, attention_mask, pixel_values, image_grid_thw, etc.
     full_result = processor.apply_chat_template(
         messages, tokenize=True, return_dict=True, return_tensors="pt"
     )
@@ -251,24 +348,30 @@ def preprocess_qwen_visual(
     if isinstance(input_ids, list):
         input_ids = torch.tensor(input_ids).unsqueeze(0)
 
+    # Start with all positions masked — only assistant tokens will be unmasked below.
     labels = torch.full_like(input_ids, IGNORE_INDEX)
 
-    input_ids_flat = input_ids[0].tolist()
-    L = len(input_ids_flat)
-    pos = 0
-    while pos < L:
-        if input_ids_flat[pos] == 77091:
-            ans_start = pos + 2
-            ans_end = ans_start
-            while ans_end < L and input_ids_flat[ans_end] != 151645:
-                ans_end += 1
-            if ans_end < L:
-                labels[0, ans_start : ans_end + 2] = input_ids[
-                    0, ans_start : ans_end + 2
-                ]
-                pos = ans_end
-        pos += 1
+    # Unmask every assistant response segment so only those tokens contribute to loss.
+    # Token 77091 = "assistant" (inside <|im_start|>assistant\n)
+    # Token 151645 = <|im_end|>
+    # Turn layout: <|im_start|> assistant \n <response...> <|im_end|> \n
+    #                            ^77091    ^+2=ans_start              ^ans_end
+    # We unmask [ans_start : ans_end+2] to include the response and closing <|im_end|>\n.
+    ids = input_ids[0]
+    asst_positions = (ids == 77091).nonzero(as_tuple=True)[0]   # one per assistant turn
+    end_positions  = (ids == 151645).nonzero(as_tuple=True)[0]  # one per im_end token
 
+    for asst_pos in asst_positions:
+        ans_start = asst_pos + 2
+        # find the first <|im_end|> that comes after this assistant token
+        later_ends = end_positions[end_positions > asst_pos]
+        if len(later_ends) == 0:
+            continue
+        ans_end = later_ends[0].item()
+        labels[0, ans_start : ans_end + 2] = ids[ans_start : ans_end + 2] # +2 includes the <|im_end|> and following \n
+
+    # If any image was missing, suppress the entire sample from contributing to
+    # the loss — corrupt visual context should not reinforce wrong predictions.
     if has_missing:
         labels = torch.full_like(input_ids, IGNORE_INDEX)
 

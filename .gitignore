@@ -24,3 +24,10 @@ output_gru_qwen_unfreeze1_smoke4/
 qwen-vl-finetune/data_analysis/*.json
 **.log
 
+# Logs and eval outputs
+logs/
+*.json.log
+inference/logs/
+**/*eval*.json
+**/*eval*.txt
+

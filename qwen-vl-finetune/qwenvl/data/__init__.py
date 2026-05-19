@@ -1,11 +1,12 @@
 import re
 from pathlib import Path
 
-_LOCAL_NAVILA_BASE = Path("/home/rithvik/IROS_proj/NaVILA-Dataset")
-if _LOCAL_NAVILA_BASE.exists():
-    NAVILA_BASE = str(_LOCAL_NAVILA_BASE)
-else:
-    NAVILA_BASE = "/weka/scratch/tinoosh/iros_dataset/NaVILA-Dataset"
+_NAVILA_CANDIDATES = [
+    "/opt/IROS_proj/NaVILA-Dataset",
+    "/home/rithvik/IROS_proj/NaVILA-Dataset",
+    "/weka/scratch/tinoosh/iros_dataset/NaVILA-Dataset",
+]
+NAVILA_BASE = next((c for c in _NAVILA_CANDIDATES if Path(c).exists()), _NAVILA_CANDIDATES[0])
 
 
 def _first_existing_path(candidates):
@@ -22,7 +23,7 @@ R2R = {
 
 ENVDROP = {
     "annotation_path": f"{NAVILA_BASE}/EnvDrop/annotations.json",
-    "data_path": f"{NAVILA_BASE}/EnvDrop/train",
+    "data_path": f"{NAVILA_BASE}/EnvDrop/videos",
 }
 
 HUMAN = {
@@ -58,6 +59,21 @@ R2R_ALIGNMENT_QA = {
     "data_path": _R2R_ALIGNMENT_QA_DATA,
 }
 
+VIDEO_CHATGPT = {
+    "annotation_path": f"{NAVILA_BASE}/Video-ChatGPT/VideoInstruct100K.json",
+    "data_path": f"{NAVILA_BASE}/Video-ChatGPT/activitynet_videos",
+}
+
+SHAREGPTVIDEO = {
+    "annotation_path": f"{NAVILA_BASE}/ShareGPTVideo/video_caption_300k.jsonl",
+    "data_path": f"{NAVILA_BASE}/ShareGPTVideo/frames",
+}
+
+SHAREGPT4V = {
+    "annotation_path": f"{NAVILA_BASE}/ShareGPT4V/sharegpt4v_mix665k_cap23k_coco-ap9k_lcs3k_sam9k_div2k.json",
+    "data_path": f"{NAVILA_BASE}/ShareGPT4V",
+}
+
 data_dict = {
     "r2r": R2R,
     "envdrop": ENVDROP,
@@ -65,6 +81,9 @@ data_dict = {
     "rxr": RXR,
     "scanqa": SCANQA,
     "r2r_alignment_qa": R2R_ALIGNMENT_QA,
+    "video_chatgpt": VIDEO_CHATGPT,
+    "sharegptvideo": SHAREGPTVIDEO,
+    "sharegpt4v": SHAREGPT4V,
 }
 
 

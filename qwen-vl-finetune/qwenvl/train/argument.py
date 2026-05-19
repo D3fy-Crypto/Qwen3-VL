@@ -45,6 +45,12 @@ class TrainingArguments(transformers.TrainingArguments):
     mm_projector_lr: Optional[float] = None
     vision_tower_lr: Optional[float] = None
 
+    ## Inference snapshots: lightweight safetensors saves (no optimizer state)
+    inference_snapshot_steps: int = field(
+        default=100,
+        metadata={"help": "Save inference-only model weights every N optimizer steps. Set 0 to disable."},
+    )
+
     ## Lora config
     lora_enable: bool = field(default=False)
     lora_r: int = field(default=64)
