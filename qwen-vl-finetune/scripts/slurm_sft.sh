@@ -71,8 +71,8 @@ MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=$(shuf -i 20001-29999 -n 1)
 NPROC_PER_NODE=${NPROC_OVERRIDE}
 
+export WANDB_ENTITY="project_llm"
 export WANDB_PROJECT="${WANDB_PROJECT}"
-export WANDB_RUN_ID="${RUN_NAME}"
 
 echo "========================================"
 echo "Job ID      : ${SLURM_JOB_ID}"
