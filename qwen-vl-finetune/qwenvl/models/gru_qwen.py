@@ -89,9 +89,9 @@ class GRUQwenModel(nn.Module):
             if checkpoint_path.exists():
                 if checkpoint_path.suffix == ".safetensors":
                     from safetensors.torch import load_file
-                    ckpt = load_file(str(checkpoint_path), device=str(device))
+                    ckpt = load_file(str(checkpoint_path), device="cpu")
                 else:
-                    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+                    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
                 state_dict = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
                 missing, unexpected = self.trajectory_gru.load_state_dict(state_dict, strict=False)
                 self.gru_checkpoint_meta = {
