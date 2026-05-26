@@ -423,6 +423,7 @@ class GRUQwenModel(nn.Module):
                 pixel_values_videos: Optional[torch.Tensor] = None,
                 video_grid_thw: Optional[torch.Tensor] = None,
                 labels: Optional[torch.Tensor] = None,
+                has_gru: Optional[torch.Tensor] = None,
                 **kwargs):
         """
         Forward pass through GRU-Qwen model.
@@ -496,25 +497,36 @@ class GRUQwenModel(nn.Module):
             aligned_rows = []
             mask_rows = []
             for b in range(input_embeds.shape[0]):
+                row_has_gru = True
+                if has_gru is not None:
+                    row_has_gru = bool(int(has_gru[b].item()))
+
                 if gru_lengths.dim() == 2:
                     seq_len = int((gru_lengths[b] > 0).sum().item())
                 else:
                     seq_len = int(gru_lengths[b].item())
                 seq_len = max(1, min(seq_len, projected.shape[1]))
 
+                # Non-VLN sample: leave text embeddings untouched, skip GRU injection.
+                if not row_has_gru:
+                    aligned_rows.append(torch.zeros_like(input_embeds[b]))
+                    mask_rows.append(
+                        torch.zeros(
+                            (input_embeds.shape[1], 1),
+                            device=input_embeds.device,
+                            dtype=input_embeds.dtype,
+                        )
+                    )
+                    placement_stats.append((0, 0, seq_len))
+                    continue
+
                 if self.motion_token_id is not None and self.motion_token_id >= 0:
                     motion_positions = (input_ids[b] == int(self.motion_token_id)).nonzero(as_tuple=False).squeeze(-1)
                 else:
                     motion_positions = torch.empty(0, dtype=torch.long, device=input_ids.device)
 
-                if motion_positions.numel() == 0:
-                    valid_positions = (
-                        combined_attention[b].nonzero(as_tuple=False).squeeze(-1)
-                        if combined_attention is not None
-                        else torch.arange(input_embeds.shape[1], device=input_embeds.device)
-                    )
-                    motion_positions = valid_positions[:seq_len]
-
+                # Sample claimed has_gru=True but no <motion> token in the prompt:
+                # treat as no-op rather than clobbering arbitrary text positions.
                 row_aligned = torch.zeros_like(input_embeds[b])
                 row_mask = torch.zeros(
                     (input_embeds.shape[1], 1),
