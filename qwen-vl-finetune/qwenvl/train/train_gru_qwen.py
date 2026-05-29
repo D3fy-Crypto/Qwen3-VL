@@ -119,7 +119,14 @@ def train(attn_implementation="flash_attention_2"):
     local_rank = training_args.local_rank
     os.makedirs(training_args.output_dir, exist_ok=True)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        if local_rank is not None and local_rank >= 0:
+            torch.cuda.set_device(local_rank)
+            device = f"cuda:{local_rank}"
+        else:
+            device = "cuda"
+    else:
+        device = "cpu"
     dtype = torch.bfloat16 if training_args.bf16 else (
         torch.float16 if training_args.fp16 else None
     )

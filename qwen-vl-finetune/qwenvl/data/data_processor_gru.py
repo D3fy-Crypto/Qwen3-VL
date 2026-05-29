@@ -10,9 +10,11 @@ from typing import Dict, Optional, Sequence, List, Tuple, Any
 from collections.abc import Sequence
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from PIL import Image as PILImage
 
 import transformers
 
@@ -91,6 +93,69 @@ def actions_to_motion_features(action_seq, theta0=0.0, step_m=0.25, turn_deg=15.
 
 def _make_abs_paths(base: Path, files: str) -> str:
     return f"{(base / files).resolve()}"
+
+
+class _MissingImage(PILImage.Image):
+    """Sentinel subclass returned when an image/frame file is not found."""
+    pass
+
+
+def _sample_frame_indices(total_frames: int, num_frames: int) -> List[int]:
+    if total_frames <= 0 or num_frames <= 0:
+        return []
+    n = min(total_frames, num_frames)
+    return np.linspace(0, total_frames - 1, num=n, dtype=int).tolist()
+
+
+def _extract_video_frames_at(video_path: str, indices: Sequence[int]) -> List[PILImage.Image]:
+    """Load specific frame indices from an mp4. Black-frame fallback on miss."""
+    cap = cv2.VideoCapture(video_path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frames: List[PILImage.Image] = []
+    if total == 0:
+        cap.release()
+        logging.warning(f"Missing or unreadable video: {video_path}, using black frames.")
+        black = PILImage.new("RGB", (224, 224))
+        black.__class__ = _MissingImage
+        return [black for _ in indices]
+    for raw_idx in indices:
+        idx = max(0, min(int(raw_idx), total - 1))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if ret:
+            frames.append(PILImage.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+        elif frames:
+            frames.append(frames[-1])
+        else:
+            frames.append(PILImage.new("RGB", (224, 224)))
+    cap.release()
+    return frames
+
+
+def _extract_video_frames(video_path: str, num_frames: int) -> List[PILImage.Image]:
+    cap = cv2.VideoCapture(video_path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total == 0:
+        cap.release()
+        logging.warning(f"Missing or unreadable video: {video_path}, using black frames.")
+        black = PILImage.new("RGB", (224, 224))
+        black.__class__ = _MissingImage
+        return [black] * num_frames
+    indices = _sample_frame_indices(total, num_frames)
+    frames = []
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if ret:
+            frames.append(PILImage.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+        elif frames:
+            frames.append(frames[-1])
+        else:
+            frames.append(PILImage.new("RGB", (224, 224)))
+    cap.release()
+    while len(frames) < num_frames:
+        frames.insert(0, PILImage.new("RGB", (224, 224)))
+    return frames[:num_frames]
 
 
 def split_video_id(video_id: str) -> Tuple[str, int]:
@@ -251,9 +316,29 @@ def update_processor_pixels(processor, data_args):
     return processor
 
 
-def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any]]:
-    # Native R2R/RxR annotation schema: {video_id, q, a, frames, ...}
-    if "conversations" not in item and "q" in item and "a" in item and "frames" in item:
+def _build_messages(item: Dict[str, Any], base_path: Path) -> Tuple[List[Dict[str, Any]], bool]:
+    """Build chat messages for a sample.
+
+    Returns:
+        (messages, has_gru): has_gru=True only for VLN samples (R2R/RxR/Human) that
+        carry a real per-step action stream the trajectory GRU can encode. For all
+        other datasets (EnvDrop / ScanQA / video_chatgpt / sharegpt*) we return
+        has_gru=False and omit the <motion> token entirely so the model skips
+        GRU injection for that row.
+    """
+    system_message = {
+        "role": "system",
+        "content": [{"type": "text", "text": "You are a helpful navigation assistant."}],
+    }
+
+    # ---- Native R2R / RxR / Human schema: {video_id, q, a, frames} (frame folder) ----
+    # This is the only branch that uses real per-step actions -> has_gru=True.
+    if (
+        "conversations" not in item
+        and "q" in item
+        and "a" in item
+        and "frames" in item
+    ):
         n_slots = int(item.get("_gru_history_slots", 8))
         selected = select_frame_slots(item.get("frames") or [], slots=n_slots)
 
@@ -300,15 +385,7 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any
         )
 
         return [
-            {
-                "role": "system",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "You are a helpful navigation assistant.",
-                    }
-                ],
-            },
+            system_message,
             {"role": "user", "content": user_content},
             {
                 "role": "assistant",
@@ -316,9 +393,116 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any
                     {"type": "text", "text": normalize_action_answer(str(item.get("a", "")))}
                 ],
             },
-        ]
+        ], True
 
-    # Extract and normalize images and videos
+    # ---- EnvDrop motion schema: {video_id, q, frames, motion} + per-frame action codes ----
+    # Same layout as R2R: 8 uniformly sampled frames, each preceded by a <motion>
+    # token whose GRU feature is the action prefix up to that frame index. The
+    # assistant target is the natural-language trajectory description in `q`.
+    if (
+        "conversations" not in item
+        and "frames" in item
+        and "motion" in item
+        and "q" in item
+        and "a" not in item
+    ):
+        n_slots = int(item.get("_gru_history_slots", 8))
+        frames = item.get("frames") or []
+        selected = select_frame_slots(frames, slots=n_slots)
+        sampled_indices = [idx for idx, _ in selected]
+
+        video_path = str((base_path / f"{item['video_id']}.mp4").resolve())
+        pil_frames = _extract_video_frames_at(video_path, sampled_indices)
+        while len(pil_frames) < n_slots:
+            pil_frames.append(PILImage.new("RGB", (224, 224)))
+
+        user_content = [
+            {
+                "type": "text",
+                "text": (
+                    "Assume you are a robot designed for navigation. You are provided "
+                    "with captured images sequences "
+                ),
+            },
+        ]
+        for pil_frame in pil_frames[:n_slots]:
+            user_content.append({"type": "text", "text": DEFAULT_MOTION_TOKEN})
+            user_content.append({"type": "image", "image": pil_frame})
+        user_content.append(
+            {
+                "type": "text",
+                "text": (
+                    ". Based on this image sequence, please describe the navigation "
+                    "trajectory of the robot."
+                ),
+            }
+        )
+
+        return [
+            system_message,
+            {"role": "user", "content": user_content},
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": str(item.get("q", ""))}],
+            },
+        ], True
+
+    # ---- EnvDrop legacy schema: {video_id (int), instruction} + single .mp4 ----
+    if (
+        "conversations" not in item
+        and "frames" not in item
+        and "instruction" in item
+        and "q" not in item
+    ):
+        video_path = str((base_path / f"{item['video_id']}.mp4").resolve())
+        pil_frames = _extract_video_frames(video_path, 8)
+        content = [
+            {
+                "type": "text",
+                "text": (
+                    "Assume you are a robot designed for navigation. You are provided "
+                    "with captured images sequences"
+                ),
+            },
+            *[{"type": "image", "image": f} for f in pil_frames],
+            {
+                "type": "text",
+                "text": (
+                    ". Based on this image sequence, please describe the navigation "
+                    "trajectory of the robot."
+                ),
+            },
+        ]
+        return [
+            system_message,
+            {"role": "user", "content": content},
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": str(item["instruction"])}],
+            },
+        ], False
+
+    # ---- ScanQA / video_chatgpt schema: {video_id, q, a} + .mp4, no frames key ----
+    if (
+        "conversations" not in item
+        and "frames" not in item
+        and "q" in item
+        and "a" in item
+    ):
+        video_path = str((base_path / f"{item['video_id']}.mp4").resolve())
+        pil_frames = _extract_video_frames(video_path, 8)
+        answer = random.choice(item["a"]) if isinstance(item["a"], list) else item["a"]
+        content = [
+            *[{"type": "image", "image": f} for f in pil_frames],
+            {"type": "text", "text": str(item["q"])},
+        ]
+        return [
+            system_message,
+            {"role": "user", "content": content},
+            {"role": "assistant", "content": [{"type": "text", "text": str(answer)}]},
+        ], False
+
+    # ---- LLaVA-style multi-turn conversations (sharegpt4v / sharegptvideo / etc.) ----
     images = item.get("image") or []
     if isinstance(images, str):
         images = [images]
@@ -327,7 +511,6 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any
     if isinstance(videos, str):
         videos = [videos]
 
-    # Build media pools with absolute paths
     image_pool = [
         {"type": "image", "image": _make_abs_paths(base_path, img)} for img in images
     ]
@@ -335,21 +518,18 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any
         {"type": "video", "video": _make_abs_paths(base_path, vid)} for vid in videos
     ]
 
-    messages = []
+    messages = [system_message]
     for turn in item["conversations"]:
         role = "user" if turn["from"] == "human" else "assistant"
         text: str = str(turn["value"])
 
         if role == "user":
-            # Normalize legacy placeholders and ensure at least one motion anchor is present.
-            text = text.replace("<gru>", DEFAULT_MOTION_TOKEN)
-            if DEFAULT_MOTION_TOKEN not in text:
-                text = f"{DEFAULT_MOTION_TOKEN}\n{text}"
+            # Strip legacy <gru>/<motion> placeholders for non-VLN conversations so the
+            # model does not see a stray motion anchor on samples with no trajectory.
+            text = text.replace("<gru>", "").replace(DEFAULT_MOTION_TOKEN, "")
 
             content = []
-            # Split text by multimodal placeholders while keeping delimiters.
-            text_parts = re.split(r"(<image>|<video>|<motion>)", text)
-
+            text_parts = re.split(r"(<image>|<video>)", text)
             for seg in text_parts:
                 if seg == "<image>":
                     if image_pool:
@@ -369,18 +549,14 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any
                             content.append({"type": "text", "text": "[missing_video]"})
                     else:
                         content.append({"type": "text", "text": "[missing_video]"})
-                elif seg == DEFAULT_MOTION_TOKEN:
-                    # Keep <motion> in user text so tokenizer emits a stable motion placeholder token.
-                    content.append({"type": "text", "text": DEFAULT_MOTION_TOKEN})
                 elif seg.strip():
                     content.append({"type": "text", "text": seg.strip()})
 
             messages.append({"role": role, "content": content})
         else:
-            # Assistant messages contain only text
             messages.append({"role": role, "content": [{"type": "text", "text": text}]})
 
-    return messages
+    return messages, False
 
 
 def preprocess_qwen_visual(
@@ -392,11 +568,12 @@ def preprocess_qwen_visual(
 
     source = sources[0]
     base_path = Path(source.get("data_path", ""))
-    messages = _build_messages(source, base_path)
+    messages, has_gru = _build_messages(source, base_path)
 
     full_result = processor.apply_chat_template(
         messages, tokenize=True, return_dict=True, return_tensors="pt"
     )
+    full_result["_has_gru"] = bool(has_gru)
 
     input_ids = full_result["input_ids"]
     if isinstance(input_ids, list):
@@ -600,6 +777,50 @@ class LazySupervisedDataset(Dataset):
             observed_steps,
         )
 
+    def _runtime_envdrop_gru_features(
+        self, source_item: Dict[str, Any]
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[str], List[int]]:
+        """Build (slots, max_t, 7) GRU prefixes for an EnvDrop motion sample.
+
+        Each sample carries the full per-frame action stream inline in `motion`,
+        so prefixes are taken directly from `motion[:frame_idx]` with the strict
+        no-future rule (slot at frame t only sees actions before t).
+        """
+        slots = self.gru_history_slots
+        frames = source_item.get("frames") or []
+        motion = source_item.get("motion") or []
+
+        selected = select_frame_slots(frames, slots=slots)
+        sampled_indices = [int(idx) for idx, _ in selected]
+        frame_ids = [frame_rel for _, frame_rel in selected]
+
+        slot_prefixes: List[torch.Tensor] = []
+        slot_lengths: List[int] = []
+        for frame_idx in sampled_indices:
+            cutoff = max(0, min(frame_idx, len(motion)))
+            action_seq = [int(a) for a in motion[:cutoff]]
+            if not action_seq:
+                prefix = actions_to_motion_features([STOP])
+            else:
+                prefix = actions_to_motion_features(action_seq)
+            slot_prefixes.append(prefix)
+            slot_lengths.append(int(prefix.size(0)))
+
+        max_t = max(slot_lengths) if slot_lengths else 1
+        padded: List[torch.Tensor] = []
+        for prefix in slot_prefixes:
+            if prefix.size(0) < max_t:
+                pad = torch.zeros((max_t - prefix.size(0), prefix.size(1)), dtype=prefix.dtype)
+                prefix = torch.cat([prefix, pad], dim=0)
+            padded.append(prefix)
+
+        return (
+            torch.stack(padded, dim=0),
+            torch.tensor(slot_lengths, dtype=torch.long),
+            frame_ids,
+            sampled_indices,
+        )
+
     @property
     def lengths(self):
         length_list = []
@@ -670,9 +891,17 @@ class LazySupervisedDataset(Dataset):
             and "a" in source_item
             and "frames" in source_item
         )
+        is_envdrop_motion = (
+            isinstance(source_item, dict)
+            and "conversations" not in source_item
+            and "frames" in source_item
+            and "motion" in source_item
+            and "q" in source_item
+            and "a" not in source_item
+        )
 
         preprocess_sources = sources
-        if is_native:
+        if is_native or is_envdrop_motion:
             patched = dict(source_item)
             patched["_gru_history_slots"] = self.gru_history_slots
             preprocess_sources = [patched]
@@ -727,11 +956,20 @@ class LazySupervisedDataset(Dataset):
         ]
         label = self.processor.tokenizer.decode(labels, skip_special_tokens=False)
 
-        if is_native:
+        # Trust the has_gru flag from _build_messages: it is the single source of
+        # truth for whether this sample carries a real per-step action stream.
+        has_gru = bool(data_dict.pop("_has_gru", is_native or is_envdrop_motion))
+
+        if has_gru and is_envdrop_motion:
+            gru_features, gru_lengths, frame_ids, step_targets = self._runtime_envdrop_gru_features(source_item)
+            data_dict["frame_ids"] = frame_ids
+            data_dict["frame_step_targets"] = step_targets
+        elif has_gru:
             gru_features, gru_lengths, frame_ids, step_targets = self._runtime_native_gru_features(source_item)
             data_dict["frame_ids"] = frame_ids
             data_dict["frame_step_targets"] = step_targets
-        else:
+        elif "gru" in source_item:
+            # Legacy LLaVA-style conversations with an explicit "gru" action list.
             raw_actions = source_item.get("gru", [])
             if not isinstance(raw_actions, list):
                 raw_actions = []
@@ -748,10 +986,18 @@ class LazySupervisedDataset(Dataset):
 
             gru_features = actions_to_motion_features(raw_actions).unsqueeze(0)
             gru_lengths = torch.tensor([int(gru_features.size(1))], dtype=torch.long)
+            has_gru = True
+        else:
+            # Non-VLN sample (EnvDrop/ScanQA/sharegpt*). No <motion> token was emitted
+            # by _build_messages, so the model will see zero motion positions and skip
+            # injection. We still emit a dummy 1x1x7 feature so the collator can stack.
+            gru_features = torch.zeros((1, 1, 7), dtype=torch.float32)
+            gru_lengths = torch.zeros((1,), dtype=torch.long)
 
         data_dict["gru_features"] = gru_features
         data_dict["gru_lengths"] = gru_lengths
         data_dict["gru_length"] = torch.tensor(int(gru_features.size(0)), dtype=torch.long)
+        data_dict["has_gru"] = torch.tensor(1 if has_gru else 0, dtype=torch.long)
 
         # Motion-token diagnostics used by debug scripts and forward alignment checks.
         motion_token_text = getattr(self.data_args, "motion_token_text", DEFAULT_MOTION_TOKEN)
@@ -955,6 +1201,11 @@ class DataCollatorForSupervisedDataset(object):
             batch["gru_features"] = feat_batch
             batch["gru_lengths"] = len_batch
 
+        if all("has_gru" in instance for instance in instances):
+            batch["has_gru"] = torch.stack(
+                [instance["has_gru"].to(dtype=torch.long) for instance in instances]
+            )
+
         if all("motion_token_id" in instance for instance in instances):
             batch["motion_token_id"] = int(instances[0]["motion_token_id"])
         if all("motion_token_count" in instance for instance in instances):
@@ -1042,6 +1293,11 @@ class FlattenedDataCollatorForSupervisedDataset(DataCollatorForSupervisedDataset
             feat_batch, len_batch = collate_gru_prefixes(instances)
             batch["gru_features"] = feat_batch
             batch["gru_lengths"] = len_batch
+
+        if all("has_gru" in instance for instance in instances):
+            batch["has_gru"] = torch.stack(
+                [instance["has_gru"].to(dtype=torch.long) for instance in instances]
+            )
 
         if all("motion_token_id" in instance for instance in instances):
             batch["motion_token_id"] = int(instances[0]["motion_token_id"])

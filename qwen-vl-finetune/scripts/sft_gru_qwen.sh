@@ -45,7 +45,7 @@ LOGGING_STEPS=${LOGGING_STEPS:-10}
 MODEL_MAX_LENGTH=${MODEL_MAX_LENGTH:-8192}
 REPORT_TO=${REPORT_TO:-wandb}
 WANDB_MODE=${WANDB_MODE:-online}
-DATASETS=${DATASETS:-r2r}
+DATASETS=${DATASETS:-r2r,rxr,envdrop,human,scanqa}
 RUN_NAME=${RUN_NAME:-gru-qwen-baseline}
 OUTPUT_DIR=${OUTPUT_DIR:-./output_gru_qwen}
 
