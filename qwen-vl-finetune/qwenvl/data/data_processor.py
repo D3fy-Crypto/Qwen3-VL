@@ -216,8 +216,7 @@ def _extract_video_frames(video_path: str, num_frames: int) -> List[PILImage.Ima
 
 
 def _build_messages(item: Dict[str, Any], base_path: Path) -> Tuple[List[Dict[str, Any]], bool]:
-    system_prompt = "You are a helpful navigation assistant."
-    messages = [{"role": "system", "content": [{"type": "text", "text": system_prompt}]}]
+    messages = []
 
     # ShareGPT4V / ShareGPTVideo: LLaVA-style multi-turn conversations format
     if "conversations" in item:
@@ -293,17 +292,28 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> Tuple[List[Dict[st
     frames = item["frames"]
     if len(frames) < 1:
         raise ValueError(f"item has no frames: {item.get('video_id', '')}")
-    current = frames[-1]
-    historical_pool = frames[:-1] if len(frames) > 1 else []
 
-    # Uniformly sample up to NUM_HISTORICAL_FRAMES from pool; prepend black frames if not enough.
-    indices = _sample_frame_indices(len(historical_pool), NUM_HISTORICAL_FRAMES)
-    loaded_historical = [_make_abs_paths(base_path, historical_pool[i]) for i in indices]
-    pad_count = NUM_HISTORICAL_FRAMES - len(loaded_historical)
+    # Match NaVILA's get_frame_from_vcap_vlnce sampling so the historical frames are
+    # spaced uniformly all the way up to (but not touching) the current frame:
+    #   1) left-pad black frames until there are at least NUM_HISTORICAL_FRAMES + 1 entries,
+    #   2) sample NUM_HISTORICAL_FRAMES historical indices over the full range with
+    #      endpoint=False — this excludes the last index, so the most-recent historical
+    #      frame is no longer forced adjacent to the current frame,
+    #   3) the last frame is always the current observation.
+    # None marks a black-padding slot; real entries are frame file paths.
     black_frame = PILImage.new("RGB", (224, 224))
-    loaded_historical = [black_frame] * pad_count + loaded_historical
+    pad_count = max(0, (NUM_HISTORICAL_FRAMES + 1) - len(frames))
+    padded = [None] * pad_count + list(frames)
 
-    loaded_current = _make_abs_paths(base_path, current)
+    hist_indices = np.linspace(
+        0, len(padded) - 1, num=NUM_HISTORICAL_FRAMES, endpoint=False, dtype=int
+    ).tolist()
+    loaded_historical = [
+        black_frame if padded[i] is None else _make_abs_paths(base_path, padded[i])
+        for i in hist_indices
+    ]
+
+    loaded_current = _make_abs_paths(base_path, frames[-1])
     has_missing = any(isinstance(f, _MissingImage) for f in loaded_historical) or isinstance(loaded_current, _MissingImage)
 
     content = [
