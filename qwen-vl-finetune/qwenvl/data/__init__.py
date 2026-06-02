@@ -22,7 +22,7 @@ R2R = {
 }
 
 ENVDROP = {
-    "annotation_path": f"{NAVILA_BASE}/EnvDrop/envdrop_motion.json",
+    "annotation_path": f"{NAVILA_BASE}/EnvDrop/annotations.json",
     "data_path": f"{NAVILA_BASE}/EnvDrop/videos",
 }
 
