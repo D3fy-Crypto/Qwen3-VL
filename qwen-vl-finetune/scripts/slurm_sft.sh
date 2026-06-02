@@ -9,6 +9,7 @@
 #SBATCH --output=/scratch/tinoosh/chang/logs/%j_%x.out
 #SBATCH --error=/scratch/tinoosh/chang/logs/%j_%x.err
 #SBATCH --nodes=1
+#SBATCH --exclude=c001
 #SBATCH --ntasks-per-node=1
 
 # ============================================================
@@ -117,6 +118,6 @@ torchrun \
         --gradient_checkpointing True \
         ${WORKERS_ARG} \
         --run_name "${RUN_NAME}" \
-        --inference_snapshot_steps 100 \
+        --inference_snapshot_steps 2000 \
         ${MAX_STEPS_ARG} \
         ${REPORT_ARG}
