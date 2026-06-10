@@ -7,7 +7,9 @@ Usage:
     python inference/run_eval.py
     python inference/run_eval.py --n 5 --base-port 8000 --sft-port 8001
     python inference/run_eval.py --datasets r2r scanqa mmmu
-    python inference/run_eval.py --no-mmmu   # skip MMMU section
+    python inference/run_eval.py --no-mmmu          # skip MMMU section
+    python inference/run_eval.py --sft-only          # only query SFT server
+    python inference/run_eval.py --sft-only --sft-port 8001
 """
 
 import argparse
@@ -245,11 +247,15 @@ def run_eval(args):
     sft_url = f"http://{args.host}:{args.sft_port}"
 
     print("\n=== Checking servers ===")
-    ok_base = check_server(base_url, "BASE")
     ok_sft = check_server(sft_url, "SFT")
-    if not ok_base or not ok_sft:
-        print("Both servers must be running. Exiting.")
+    if not ok_sft:
+        print("SFT server must be running. Exiting.")
         sys.exit(1)
+    if not args.sft_only:
+        ok_base = check_server(base_url, "BASE")
+        if not ok_base:
+            print("BASE server must be running (use --sft-only to skip). Exiting.")
+            sys.exit(1)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -271,12 +277,12 @@ def run_eval(args):
                 else:
                     messages, gt = build_nav_messages(item, cfg["data_path"])
 
-                base_resp = call_server(base_url, messages, args.max_new_tokens)
+                base_resp = "N/A" if args.sft_only else call_server(base_url, messages, args.max_new_tokens)
                 sft_resp = call_server(sft_url, messages, args.max_new_tokens)
                 print("done")
             except Exception as e:
                 print(f"FAILED: {e}")
-                base_resp = f"[BUILD ERROR] {e}"
+                base_resp = "N/A" if args.sft_only else f"[BUILD ERROR] {e}"
                 sft_resp = f"[BUILD ERROR] {e}"
                 gt = item.get("a", "")
                 if isinstance(gt, list):
@@ -303,12 +309,13 @@ def run_eval(args):
                 print(f"  [{i+1}/{len(mmmu_items)}] {subject} ...", end=" ", flush=True)
                 try:
                     messages, gt = build_mmmu_messages(item)
-                    base_resp = call_server(base_url, messages, max_new_tokens=16)
+                    base_resp = "N/A" if args.sft_only else call_server(base_url, messages, max_new_tokens=16)
                     sft_resp = call_server(sft_url, messages, max_new_tokens=16)
                     print("done")
                 except Exception as e:
                     print(f"FAILED: {e}")
-                    base_resp = sft_resp = f"[BUILD ERROR] {e}"
+                    base_resp = "N/A" if args.sft_only else f"[BUILD ERROR] {e}"
+                    sft_resp = f"[BUILD ERROR] {e}"
                     gt = item["row"].get("answer", "")
 
                 row = item["row"]
@@ -363,6 +370,7 @@ def parse_args():
                         choices=list(DATASET_CONFIGS.keys()))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-mmmu", action="store_true", help="Skip MMMU general benchmark questions")
+    parser.add_argument("--sft-only", action="store_true", help="Only query SFT server; skip BASE server")
     return parser.parse_args()
 
 

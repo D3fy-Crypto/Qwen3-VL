@@ -60,12 +60,12 @@ args=(
     --model_name_or_path "${MODEL_NAME_OR_PATH}"
     --projector_k "${PROJECTOR_K}"
     --tune_projector True
-    --tune_qwen_vision False
-    --tune_qwen_lm False
+    --tune_qwen_vision True
+    --tune_qwen_lm True
     --qwen_lm_unfreeze_last_n_layers "${QWEN_LM_UNFREEZE_LAST_N_LAYERS}"
     --qwen_unfreeze_lm_head "${QWEN_UNFREEZE_LM_HEAD}"
     --dataset_use "${DATASETS}"
-    --data_flatten False
+    --data_flatten True
     --bf16
     --output_dir "${OUTPUT_DIR}"
     --num_train_epochs "${NUM_TRAIN_EPOCHS}"
