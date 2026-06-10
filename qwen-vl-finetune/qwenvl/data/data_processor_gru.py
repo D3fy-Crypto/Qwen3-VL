@@ -158,6 +158,43 @@ def _extract_video_frames(video_path: str, num_frames: int) -> List[PILImage.Ima
     return frames[:num_frames]
 
 
+# Number of frames sampled for LLaVA-style (sharegpt4v / sharegptvideo) samples,
+# matching the base data_processor (NUM_HISTORICAL_FRAMES + 1).
+NUM_HISTORICAL_FRAMES = 7
+
+
+def _strip_visual_tokens(text: str) -> str:
+    """Remove visual placeholder tokens from text; images are attached separately."""
+    for tok in ("<image>", "<video>", "<gru>", DEFAULT_MOTION_TOKEN):
+        text = text.replace(tok, "")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _normalize_conversations(conversations: List[Dict]) -> List[Dict]:
+    out = []
+    for turn in conversations:
+        speaker = turn.get("from", "")
+        if speaker in {"human", "user"}:
+            out.append({"from": "human", "value": str(turn.get("value", ""))})
+        elif speaker in {"gpt", "assistant"}:
+            out.append({"from": "gpt", "value": str(turn.get("value", ""))})
+    return out
+
+
+def _load_frame_dir(frame_dir: Path, num_frames: int) -> Tuple[List[PILImage.Image], bool]:
+    """Load uniformly sampled frames from a directory of pre-extracted image files."""
+    exts = {".jpeg", ".jpg", ".png"}
+    try:
+        files = sorted(p for p in frame_dir.iterdir() if p.suffix.lower() in exts)
+    except (FileNotFoundError, NotADirectoryError):
+        files = []
+    if not files:
+        return [PILImage.new("RGB", (224, 224))] * num_frames, True
+    indices = _sample_frame_indices(len(files), num_frames)
+    frames = [PILImage.open(files[i]).convert("RGB") for i in indices]
+    return frames, False
+
+
 def split_video_id(video_id: str) -> Tuple[str, int]:
     if not isinstance(video_id, str) or "-" not in video_id:
         return str(video_id), 0
@@ -503,58 +540,42 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> Tuple[List[Dict[st
         ], False
 
     # ---- LLaVA-style multi-turn conversations (sharegpt4v / sharegptvideo / etc.) ----
-    images = item.get("image") or []
-    if isinstance(images, str):
-        images = [images]
+    # Mirror the base (non-GRU) data processor: load every visual as PIL image frames
+    # and prepend them to the first user turn. ShareGPT4V stores image files;
+    # ShareGPTVideo stores pre-extracted frames under frames/{video}/. We never emit a
+    # {"type": "video"} item, because HF's load_video rejects a frame-dir / list path
+    # (the cause of the "Incorrect format used for video" crash). has_gru=False.
+    turns = _normalize_conversations(item["conversations"])
+    images: List[PILImage.Image] = []
 
-    videos = item.get("video") or []
-    if isinstance(videos, str):
-        videos = [videos]
-
-    image_pool = [
-        {"type": "image", "image": _make_abs_paths(base_path, img)} for img in images
-    ]
-    video_pool = [
-        {"type": "video", "video": _make_abs_paths(base_path, vid)} for vid in videos
-    ]
+    if "image" in item:
+        image_files = item["image"] if isinstance(item["image"], list) else [item["image"]]
+        for img_file in image_files:
+            img_path = base_path / str(img_file)
+            try:
+                images.append(PILImage.open(img_path).convert("RGB"))
+            except (FileNotFoundError, OSError):
+                black = PILImage.new("RGB", (224, 224))
+                black.__class__ = _MissingImage
+                images.append(black)
+    elif "video" in item:
+        # ShareGPTVideo — frames pre-extracted in frames/{video}/ directory.
+        frame_dir = base_path / str(item["video"])
+        images, _ = _load_frame_dir(frame_dir, NUM_HISTORICAL_FRAMES + 1)
 
     messages = [system_message]
-    for turn in item["conversations"]:
+    for i, turn in enumerate(turns):
         role = "user" if turn["from"] == "human" else "assistant"
-        text: str = str(turn["value"])
-
-        if role == "user":
-            # Strip legacy <gru>/<motion> placeholders for non-VLN conversations so the
-            # model does not see a stray motion anchor on samples with no trajectory.
-            text = text.replace("<gru>", "").replace(DEFAULT_MOTION_TOKEN, "")
-
-            content = []
-            text_parts = re.split(r"(<image>|<video>)", text)
-            for seg in text_parts:
-                if seg == "<image>":
-                    if image_pool:
-                        cand = image_pool.pop(0)
-                        if Path(cand["image"]).exists():
-                            content.append(cand)
-                        else:
-                            content.append({"type": "text", "text": "[missing_image]"})
-                    else:
-                        content.append({"type": "text", "text": "[missing_image]"})
-                elif seg == "<video>":
-                    if video_pool:
-                        cand = video_pool.pop(0)
-                        if Path(cand["video"]).exists():
-                            content.append(cand)
-                        else:
-                            content.append({"type": "text", "text": "[missing_video]"})
-                    else:
-                        content.append({"type": "text", "text": "[missing_video]"})
-                elif seg.strip():
-                    content.append({"type": "text", "text": seg.strip()})
-
-            messages.append({"role": role, "content": content})
+        value = turn["value"]
+        if role == "assistant":
+            content = [{"type": "text", "text": value}]
+        elif i == 0:
+            # First user turn: strip visual/motion tokens and prepend all images.
+            content = [{"type": "image", "image": img} for img in images]
+            content.append({"type": "text", "text": _strip_visual_tokens(value)})
         else:
-            messages.append({"role": role, "content": [{"type": "text", "text": text}]})
+            content = [{"type": "text", "text": _strip_visual_tokens(value)}]
+        messages.append({"role": role, "content": content})
 
     return messages, False
 
