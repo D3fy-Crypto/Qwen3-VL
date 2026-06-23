@@ -25,7 +25,7 @@ from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL_PATH = "/home/rithvik/IROS_proj/models/qwen3vl-sft-20260420-1813"
+DEFAULT_MODEL_PATH = "/home/chang/vla/models/qwen3vl-sft-20260519-2207"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8001
 
