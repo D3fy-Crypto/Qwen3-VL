@@ -4,7 +4,7 @@ FastAPI inference server for the fine-tuned Qwen3-VL SFT model.
 Usage:
     python inference/server_sft.py [--model-path PATH] [--host HOST] [--port PORT]
 
-Default model: /home/rithvik/IROS_proj/models/qwen3vl-sft-20260420-1813
+Default model: /home/rithvik/IROS_proj/models/final_checkpoint
 Default port:  8001
 """
 
