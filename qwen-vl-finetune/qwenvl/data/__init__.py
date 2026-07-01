@@ -27,17 +27,27 @@ ENVDROP = {
 }
 
 # ---- GRU-encoded variants -------------------------------------------------
-# The plain annotations above have no per-step GRU encoding. These point at the
-# new annotation files that carry the trajectory action stream the GRU consumes:
-#   * R2R    annotations_with_gru.json  -> native {video_id,q,a,frames} + explicit
-#            `gru` action list (has_gru=True; _single_trajectory_actions reads `gru`).
-#   * EnvDrop envdrop_motion.json       -> {video_id,q,frames,motion} motion schema,
-#            no `a` (has_gru=True; prefixes built from inline `motion`).
-# RxR / Human have no with-gru file: their GRU features come from the cumulative
-# action index over the plain annotations, so keep using `rxr` / `human`.
+# These point at annotation files that carry the per-step `gru` action stream the
+# GRU consumes (has_gru=True; _single_trajectory_actions reads `gru`).
+#   * R2R / RxR / Human: the OVERSAMPLED annotations (what training loads) with a
+#     `gru` field added per row. Built + verified by "gru data generation/"; deploy
+#     each generated/<ds>_oversampled_with_gru.json to
+#     <DS>/annotations_oversampled_with_gru.json before training.
+#   * EnvDrop envdrop_motion.json -> {video_id,q,frames,motion} inline per-frame
+#     motion schema, no `a` (has_gru=True; prefixes built from inline `motion`).
 R2R_GRU = {
-    "annotation_path": f"{NAVILA_BASE}/R2R/annotations_with_gru.json",
+    "annotation_path": f"{NAVILA_BASE}/R2R/annotations_oversampled_with_gru.json",
     "data_path": f"{NAVILA_BASE}/R2R/train",
+}
+
+RXR_GRU = {
+    "annotation_path": f"{NAVILA_BASE}/RxR/annotations_oversampled_with_gru.json",
+    "data_path": f"{NAVILA_BASE}/RxR/train",
+}
+
+HUMAN_GRU = {
+    "annotation_path": f"{NAVILA_BASE}/Human/annotations_oversampled_with_gru.json",
+    "data_path": f"{NAVILA_BASE}/Human/raw_frames",
 }
 
 ENVDROP_GRU = {
@@ -97,6 +107,8 @@ data_dict = {
     "r2r": R2R,
     "envdrop": ENVDROP,
     "r2r_gru": R2R_GRU,
+    "rxr_gru": RXR_GRU,
+    "human_gru": HUMAN_GRU,
     "envdrop_gru": ENVDROP_GRU,
     "human": HUMAN,
     "rxr": RXR,

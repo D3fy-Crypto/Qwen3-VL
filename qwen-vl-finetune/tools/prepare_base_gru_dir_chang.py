@@ -130,7 +130,7 @@ def main():
         print(f"[verify] tokenizer check skipped: {e}")
 
     print(f"\n[done] BASE_GRU_DIR ready{' (dry-run, nothing written)' if args.dry_run else ''}: {base}")
-    print(f"       run:  BASE_GRU_DIR={base} bash scripts/sft_gru_qwen_chang.sh")
+    print(f"       run:  BASE_GRU_DIR={base} bash scripts/slurm_gru_qwen_chang.sh")
 
 
 if __name__ == "__main__":
