@@ -17,7 +17,7 @@ def _first_existing_path(candidates):
     return str(Path(candidates[0]))
 
 R2R = {
-    "annotation_path": f"{NAVILA_BASE}/R2R/annotations.json",
+    "annotation_path": f"{NAVILA_BASE}/R2R/annotations_oversampled.json",
     "data_path": f"{NAVILA_BASE}/R2R/train",
 }
 
@@ -46,12 +46,12 @@ ENVDROP_GRU = {
 }
 
 HUMAN = {
-    "annotation_path": f"{NAVILA_BASE}/Human/annotations.json",
+    "annotation_path": f"{NAVILA_BASE}/Human/annotations_oversampled.json",
     "data_path": f"{NAVILA_BASE}/Human/raw_frames",
 }
 
 RXR = {
-    "annotation_path": f"{NAVILA_BASE}/RxR/annotations.json",
+    "annotation_path": f"{NAVILA_BASE}/RxR/annotations_oversampled.json",
     "data_path": f"{NAVILA_BASE}/RxR/train",
 }
 

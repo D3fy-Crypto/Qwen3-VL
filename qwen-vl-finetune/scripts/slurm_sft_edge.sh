@@ -16,9 +16,9 @@
 # ============================================================
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-MODEL_PATH="/home/djonna1/scratchtinoosh/iros_dataset/Qwen-Model/instruct"
+MODEL_PATH="/home/djonna1/scratchtinoosh/iros_dataset/Qwen-Model/Qwen3-VL-2B-Instruct"
 DATASETS="r2r,envdrop,human,rxr,scanqa,video_chatgpt,sharegptvideo,sharegpt4v"
-RUN_NAME="qwen3vl-sft-$(date +%Y%m%d-%H%M)"
+RUN_NAME="qwen3vl-sft-edge-$(date +%Y%m%d-%H%M)"
 OUTPUT_DIR="/scratch/tinoosh/chang/checkpoints/${RUN_NAME}"
 WANDB_PROJECT="qwen3vl-sft"
 
