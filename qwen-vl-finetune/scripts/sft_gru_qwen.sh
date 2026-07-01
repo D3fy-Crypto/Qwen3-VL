@@ -41,6 +41,7 @@ GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-4}
 NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS:-3}
 MAX_STEPS=${MAX_STEPS:-}
 SAVE_STEPS=${SAVE_STEPS:-500}
+INFERENCE_SNAPSHOT_STEPS=${INFERENCE_SNAPSHOT_STEPS:-100}
 LOGGING_STEPS=${LOGGING_STEPS:-10}
 MODEL_MAX_LENGTH=${MODEL_MAX_LENGTH:-8192}
 REPORT_TO=${REPORT_TO:-wandb}
@@ -77,6 +78,7 @@ args=(
     --save_strategy steps
     --save_steps "${SAVE_STEPS}"
     --save_total_limit 2
+    --inference_snapshot_steps "${INFERENCE_SNAPSHOT_STEPS}"
     --learning_rate "${LEARNING_RATE}"
     --weight_decay 0.01
     --warmup_ratio 0.05
@@ -136,3 +138,6 @@ torchrun --nproc_per_node=${NPROC_PER_NODE} \
          --master_addr=${MASTER_ADDR} \
          --master_port=${MASTER_PORT} \
          ${ENTRY_FILE} "${args[@]}"
+
+
+
