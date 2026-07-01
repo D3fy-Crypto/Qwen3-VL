@@ -18,8 +18,11 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 MODEL_PATH="/home/djonna1/scratchtinoosh/iros_dataset/Qwen-Model/instruct"
 DATASETS="r2r,envdrop,human,rxr,scanqa,video_chatgpt,sharegptvideo,sharegpt4v"
-RUN_NAME="qwen3vl-sft-$(date +%Y%m%d-%H%M)"
-OUTPUT_DIR="/scratch/tinoosh/chang/checkpoints/${RUN_NAME}"
+# To resume a previous run, submit with:
+#   sbatch --export=ALL,RUN_NAME=<old_run_name> scripts/slurm_sft.sh
+# The training code auto-detects checkpoint-* in OUTPUT_DIR and resumes.
+RUN_NAME="${RUN_NAME:-qwen3vl-sft-$(date +%Y%m%d-%H%M)}"
+OUTPUT_DIR="${OUTPUT_DIR:-/scratch/tinoosh/chang/checkpoints/${RUN_NAME}}"
 WANDB_PROJECT="qwen3vl-sft"
 
 LR=1e-4
@@ -40,8 +43,8 @@ if [[ "${SMOKE:-0}" == "1" ]]; then
     PIXELS_ARG="--max_pixels 50176 --min_pixels 784"
     WORKERS_ARG="--dataloader_num_workers 8"
     DEEPSPEED_ARG="--deepspeed ./scripts/zero3.json"
-    RUN_NAME="smoke-$(date +%Y%m%d-%H%M)"
-    OUTPUT_DIR="/scratch/tinoosh/chang/checkpoints/${RUN_NAME}"
+    RUN_NAME="${RUN_NAME:-smoke-$(date +%Y%m%d-%H%M)}"
+    OUTPUT_DIR="${OUTPUT_DIR:-/scratch/tinoosh/chang/checkpoints/${RUN_NAME}}"
 else
     NPROC_OVERRIDE=4
     MAX_STEPS_ARG=""
@@ -73,6 +76,9 @@ NPROC_PER_NODE=${NPROC_OVERRIDE}
 
 export WANDB_ENTITY="project_llm"
 export WANDB_PROJECT="${WANDB_PROJECT}"
+# Tie the W&B run id to RUN_NAME so a resumed job continues the same curve.
+export WANDB_RUN_ID="${RUN_NAME}"
+export WANDB_RESUME="allow"
 
 echo "========================================"
 echo "Job ID      : ${SLURM_JOB_ID}"
