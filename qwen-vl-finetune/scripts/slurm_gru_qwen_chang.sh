@@ -82,18 +82,14 @@ USE_DEEPSPEED=${USE_DEEPSPEED:-1}
 DEEPSPEED=${DEEPSPEED:-./scripts/zero3.json}
 
 # --- DEBUG smoke mode (real-time interactive debugging) ----------------------
-# DEBUG=1 -> tiny, fast crash-and-fix loop on the SAME 4-GPU ZeRO-3 setup so
-# distributed-only bugs still reproduce. Set BEFORE the defaults below so these
-# values win, yet each one stays overridable via its own env var.
+# DEBUG=1 -> production-shape smoke on the SAME 4-GPU ZeRO-3 setup: batch / grad-accum
+# / seq-len / datasets / workers all INHERIT the real defaults below, so on matching
+# hardware this is a faithful dress rehearsal (identical memory + throughput). Only the
+# knobs that keep it SHORT and NON-PERSISTENT are set here; each stays overridable.
 if [[ "${DEBUG:-0}" == "1" ]]; then
     MAX_STEPS=${MAX_STEPS:-20}
-    PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-1}
-    GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-1}
-    DATASETS=${DATASETS:-r2r_gru}
-    MODEL_MAX_LENGTH=${MODEL_MAX_LENGTH:-1024}
     LOGGING_STEPS=${LOGGING_STEPS:-1}
     SAVE_STRATEGY=${SAVE_STRATEGY:-no}
-    DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-0}
     REPORT_TO=${REPORT_TO:-none}
     WANDB_MODE=${WANDB_MODE:-offline}
 fi

@@ -103,6 +103,20 @@ class _MissingImage(PILImage.Image):
     pass
 
 
+def _load_image_or_black(path_str: str) -> "PILImage.Image":
+    """Load an image path to RGB PIL; on a missing/corrupt file return a black
+    _MissingImage sentinel. Mirrors the fallback the ScanQA / ShareGPT branches
+    already use, so a missing nav frame degrades to a black image instead of
+    crashing the whole run inside the HF image processor's load_image."""
+    try:
+        return PILImage.open(path_str).convert("RGB")
+    except (FileNotFoundError, OSError):
+        logging.warning(f"Missing image: {path_str}, using black frame.")
+        black = PILImage.new("RGB", (224, 224))
+        black.__class__ = _MissingImage
+        return black
+
+
 def _sample_frame_indices(total_frames: int, num_frames: int) -> List[int]:
     if total_frames <= 0 or num_frames <= 0:
         return []
@@ -192,10 +206,13 @@ def _load_frame_dir(frame_dir: Path, num_frames: int) -> Tuple[List[PILImage.Ima
     except (FileNotFoundError, NotADirectoryError):
         files = []
     if not files:
-        return [PILImage.new("RGB", (224, 224))] * num_frames, True
+        black = PILImage.new("RGB", (224, 224))
+        black.__class__ = _MissingImage
+        return [black] * num_frames, True
     indices = _sample_frame_indices(len(files), num_frames)
-    frames = [PILImage.open(files[i]).convert("RGB") for i in indices]
-    return frames, False
+    frames = [_load_image_or_black(str(files[i])) for i in indices]
+    missing = any(isinstance(f, _MissingImage) for f in frames)
+    return frames, missing
 
 
 def split_video_id(video_id: str) -> Tuple[str, int]:
@@ -400,7 +417,7 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> Tuple[List[Dict[st
                 }
             )
             user_content.append(
-                {"type": "image", "image": _make_abs_paths(base_path, frame_rel)}
+                {"type": "image", "image": _load_image_or_black(_make_abs_paths(base_path, frame_rel))}
             )
 
         user_content.append(
@@ -585,6 +602,15 @@ def preprocess_qwen_visual(
     base_path = Path(source.get("data_path", ""))
     messages, has_gru = _build_messages(source, base_path)
 
+    # Any image that fell back to a black _MissingImage sentinel (missing/corrupt
+    # file) marks the sample as visually broken — mirrors baseline data_processor.
+    has_missing = any(
+        isinstance(c.get("image"), _MissingImage)
+        for m in messages
+        for c in (m.get("content") or [])
+        if isinstance(c, dict)
+    )
+
     full_result = processor.apply_chat_template(
         messages, tokenize=True, return_dict=True, return_tensors="pt"
     )
@@ -611,6 +637,12 @@ def preprocess_qwen_visual(
                 ]
                 pos = ans_end
         pos += 1
+
+    # Baseline parity: a sample with any missing/black image still runs the forward
+    # (keeps ZeRO-3 + vision collectives in lockstep across ranks) but contributes
+    # ZERO loss, so corrupt visual context can't reinforce wrong predictions.
+    if has_missing:
+        labels = torch.full_like(input_ids, IGNORE_INDEX)
 
     full_result["labels"] = labels
     full_result["input_ids"] = input_ids

@@ -207,7 +207,13 @@ class Qwen3VLGRUForConditionalGeneration(Qwen3VLPreTrainedModel):
         mask = input_ids == gru_token_id                                 # (rows, L)
         n_ph = int(mask.sum())
         if n_ph == 0:
-            return inputs_embeds                                         # all-QA batch
+            # All-QA microbatch: no <gru> to splice. Still tie the projector into
+            # the graph with zero weight so EVERY trainable projector param gets a
+            # (zero) gradient on this rank. Under ZeRO-3 the per-param grad-reduce
+            # hooks must fire in lockstep across ranks; otherwise a rank whose
+            # microbatch happens to be all-QA skips the projector reduce while
+            # nav-carrying ranks perform it -> reduce-scatter desync -> NCCL hang.
+            return inputs_embeds + 0.0 * projected.sum()                 # all-QA batch
 
         # Replacement vectors = the nav samples' projected vectors, in sample order.
         # Non-nav samples emit no <gru>, so placeholders occur once per nav sample in
