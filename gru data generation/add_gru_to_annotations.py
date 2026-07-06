@@ -26,7 +26,11 @@ from pathlib import Path
 
 # Allow running from anywhere: the shared module sits next to this file.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from nav_action_encoding import build_trajectory_gru, split_video_id  # noqa: E402
+from nav_action_encoding import (  # noqa: E402
+    accumulate_episodes,
+    episodes_to_step_gru,
+    split_video_id,
+)
 
 # Same auto-detect order as qwen-vl-finetune/qwenvl/data/__init__.py.
 NAVILA_CANDIDATES = [
@@ -40,6 +44,12 @@ DATASET_INPUT = {
     "r2r": "R2R/annotations.json",
     "rxr": "RxR/annotations.json",
     "human": "Human/annotations.json",
+}
+# dataset -> relative path of the oversampled annotations (what training loads).
+DATASET_OVERSAMPLED = {
+    "r2r": "R2R/annotations_oversampled.json",
+    "rxr": "RxR/annotations_oversampled.json",
+    "human": "Human/annotations_oversampled.json",
 }
 
 
@@ -61,23 +71,37 @@ def main():
     ap.add_argument("--dataset", choices=sorted(DATASET_INPUT), required=True)
     ap.add_argument("--navila-base", default=None, help="override NaVILA-Dataset root")
     ap.add_argument("--input", default=None, help="explicit annotations.json (overrides --dataset path)")
+    ap.add_argument("--oversampled", action="store_true",
+                    help="use annotations_oversampled.json as the records to emit; "
+                         "the trajectory map is still built from the UNION of the plain "
+                         "+ oversampled files so exclusive prefixes stay complete")
     ap.add_argument("--out-dir", default=str(Path(__file__).resolve().parent / "generated"))
     ap.add_argument("--limit", type=int, default=0, help="only process the first N rows (quick check)")
     ap.add_argument("--indent", type=int, default=0, help="JSON indent (0 = compact, matches on-disk format)")
     args = ap.parse_args()
 
     base = detect_navila_base(args.navila_base)
-    in_path = args.input or os.path.join(base, DATASET_INPUT[args.dataset])
+
+    # `in_path` = the records we emit (with gru attached). In oversampled mode this is
+    # the oversampled file; the plain file is loaded only to complete the trajectory map.
+    if args.input:
+        in_path = args.input
+    elif args.oversampled:
+        in_path = os.path.join(base, DATASET_OVERSAMPLED[args.dataset])
+    else:
+        in_path = os.path.join(base, DATASET_INPUT[args.dataset])
     if not Path(in_path).exists():
         raise FileNotFoundError(f"Input annotations not found: {in_path}")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     suffix = f"_first{args.limit}" if args.limit else ""
-    out_path = out_dir / f"{args.dataset}_annotations_with_gru{suffix}.json"
+    stem = f"{args.dataset}_oversampled_with_gru" if args.oversampled else f"{args.dataset}_annotations_with_gru"
+    out_path = out_dir / f"{stem}{suffix}.json"
 
     print(f"[gen] dataset   : {args.dataset}")
     print(f"[gen] navila    : {base}")
+    print(f"[gen] oversampled: {args.oversampled}")
     print(f"[gen] input     : {in_path}")
     print(f"[gen] output    : {out_path}")
 
@@ -88,13 +112,36 @@ def main():
         records = records[: args.limit]
     print(f"[gen] loaded {len(records):,} records in {time.time()-t0:.1f}s")
 
-    # Reconstruct episodes -> {video_id: gru}, then attach to each row in place
-    # (preserving original key order + record order).
-    vid_gru = build_trajectory_gru(records)
-    n_traj = len({split_video_id(str(r.get('video_id', '')))[0] for r in records})
+    # Build the trajectory->step->codes map. In oversampled mode we UNION the plain
+    # annotations first so every step of a trajectory is present even if oversampling
+    # dropped some — the per-video_id gru is deterministic, so duplicates are harmless.
+    episodes = accumulate_episodes(records)
+    if args.oversampled and not args.input:
+        plain_path = os.path.join(base, DATASET_INPUT[args.dataset])
+        if Path(plain_path).exists():
+            t1 = time.time()
+            with open(plain_path) as f:
+                plain_records = json.load(f)
+            before = sum(len(v) for v in episodes.values())
+            accumulate_episodes(plain_records, episodes)
+            after = sum(len(v) for v in episodes.values())
+            del plain_records
+            print(f"[gen] unioned plain {plain_path} in {time.time()-t1:.1f}s "
+                  f"(+{after-before:,} steps not in oversampled)")
+        else:
+            print(f"[gen] WARNING: plain file not found ({plain_path}); "
+                  f"reconstructing from oversampled alone (gaps possible)")
+
+    step_gru = episodes_to_step_gru(episodes)
+
+    # Attach gru to each emitted row in place (preserving key + record order).
+    # gru length (= number of history actions in the trajectory so far) has NO
+    # relationship to len(frames); the two are independent and are not compared.
+    n_traj = len(episodes)
     max_len = 0
     for rec in records:
-        g = vid_gru[str(rec.get("video_id", ""))]
+        traj, step = split_video_id(str(rec.get("video_id", "")))
+        g = step_gru[traj][step]
         rec["gru"] = g
         if len(g) > max_len:
             max_len = len(g)

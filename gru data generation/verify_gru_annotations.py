@@ -32,8 +32,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from nav_action_encoding import (  # noqa: E402
+    accumulate_episodes,
     action_codes_from_answer,
     build_trajectory_gru,
+    episodes_to_step_gru,
     split_video_id,
 )
 
@@ -47,6 +49,11 @@ DATASET_INPUT = {
     "r2r": "R2R/annotations.json",
     "rxr": "RxR/annotations.json",
     "human": "Human/annotations.json",
+}
+DATASET_OVERSAMPLED = {
+    "r2r": "R2R/annotations_oversampled.json",
+    "rxr": "RxR/annotations_oversampled.json",
+    "human": "Human/annotations_oversampled.json",
 }
 # action_dict_all locations (R2R's lives at the dataset root; Human has none).
 ACTION_DICT = {
@@ -93,6 +100,9 @@ def main():
     ap.add_argument("--navila-base", default=None)
     ap.add_argument("--input", default=None, help="plain annotations.json (default from --dataset)")
     ap.add_argument("--generated", default=None, help="generated *_with_gru.json to validate")
+    ap.add_argument("--oversampled", action="store_true",
+                    help="union the oversampled file into the recompute base so the "
+                         "checks cover every oversampled row (matches generator's map)")
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args()
 
@@ -112,8 +122,26 @@ def main():
     print(f"[verify] episodes={n_traj:,} | duplicate video_ids={dup_vids:,} | "
           f"episodes with gaps/non-zero-start={gaps:,}")
 
-    # Recompute gru from plain annotations (the source of truth for the rule).
-    recomputed = build_trajectory_gru(records)
+    # Recompute gru. Base = plain annotations (source of truth for the rule). In
+    # --oversampled mode, union the oversampled file too so recomputed covers every
+    # oversampled video_id (identical map to the generator).
+    episodes = accumulate_episodes(records)
+    if args.oversampled and not args.limit:
+        over_path = os.path.join(base, DATASET_OVERSAMPLED[args.dataset])
+        if Path(over_path).exists():
+            with open(over_path) as f:
+                over_records = json.load(f)
+            accumulate_episodes(over_records, episodes)
+            del over_records
+            print(f"[verify] unioned oversampled {over_path}")
+    step_gru = episodes_to_step_gru(episodes)
+    recomputed = {}
+    for rec in records:
+        vid = str(rec.get("video_id", ""))
+        traj, step = split_video_id(vid)
+        recomputed[vid] = step_gru[traj][step]
+    # keep step_gru for --generated coverage of oversampled-only vids
+    _step_gru_full = step_gru
 
     failures = []
 
@@ -199,19 +227,38 @@ def main():
             gen = gen[: args.limit]
         diffs = 0
         shown = 0
+        uncovered = 0
+        struct_bad = 0
         for r in gen:
             vid = str(r.get("video_id", ""))
+            g = [int(x) for x in r.get("gru", [])]
+            # structural checks on the FILE's own gru. NOTE: len(frames) is
+            # intentionally NOT checked — gru length (number of history actions) is
+            # unrelated to how many frames a slice stores.
+            if not g or g[-1] != 0 or 0 in g[:-1] or any(c not in VALID_CODES for c in g):
+                struct_bad += 1
+            # expected gru: prefer plain recompute; fall back to full (union) map so
+            # oversampled-only trajectories are still covered.
             exp = recomputed.get(vid)
             if exp is None:
+                traj, step = split_video_id(vid)
+                exp = _step_gru_full.get(traj, {}).get(step)
+            if exp is None:
+                uncovered += 1
                 continue
-            if [int(x) for x in r.get("gru", [])] != exp:
+            if g != exp:
                 diffs += 1
                 if shown < 3:
-                    print(f"   [generated DIFF] {vid}: file={r.get('gru')} recomputed={exp}")
+                    print(f"   [generated DIFF] {vid}: file={g[:10]} recomputed={exp[:10]}")
                     shown += 1
-        print(f"[verify] generated file {Path(args.generated).name}: rows={len(gen):,} diffs={diffs}")
+        print(f"[verify] generated file {Path(args.generated).name}: rows={len(gen):,} "
+              f"diffs={diffs} uncovered={uncovered} struct_bad={struct_bad}")
         if diffs:
             failures.append(f"{diffs} generated-file diffs")
+        if uncovered:
+            failures.append(f"{uncovered} generated rows with no reconstructable gru")
+        if struct_bad:
+            failures.append(f"{struct_bad} generated rows failing structural check")
 
     print("=" * 60)
     if failures:

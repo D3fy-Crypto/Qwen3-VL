@@ -14,11 +14,15 @@ Action codes:  STOP=0  FORWARD=1  TURN_LEFT=2  TURN_RIGHT=3
 
 `gru(step S) = concat(action_codes(a) for every prior step k < S) + [0]`
 
-The trailing ``0`` is a *structural placeholder for the current frame/node* (the
-action still to be predicted), NOT a STOP the agent emitted: it is present on every
-row regardless of the answer, which is what makes ``len(gru) == len(frames)``. A real
-STOP answer parses to ``[]`` and contributes nothing, so genuine stops never add an
-interior ``0`` — the only ``0`` is the structural tail.
+The trailing ``0`` is a *structural placeholder for the current node* (the action
+still to be predicted), NOT a STOP the agent emitted: it is present on every row
+regardless of the answer. A real STOP answer parses to ``[]`` and contributes
+nothing, so genuine stops never add an interior ``0`` — the only ``0`` is the tail.
+
+``gru`` encodes the *history of actions* in the trajectory so far; its length has NO
+relationship to ``len(frames)`` (how many frames a slice stores). They are independent
+and must not be compared. (They happen to be equal for the simulator datasets R2R/RxR
+only because those store one frame per motion primitive; real-video Human does not.)
 """
 
 import re
@@ -78,6 +82,42 @@ def split_video_id(video_id: str) -> Tuple[str, int]:
         return traj, 0
 
 
+def accumulate_episodes(records, episodes=None):
+    """Fold rows into ``episodes[traj][step] = own_action_codes`` (in place).
+
+    Call repeatedly to *union* several record lists (e.g. the plain annotations
+    plus an oversampled copy): the first record seen for a given ``(traj, step)``
+    wins, so identical duplicates and re-orderings are harmless, and steps present
+    in either source are all captured. Returns the same ``episodes`` dict.
+    """
+    if episodes is None:
+        episodes = defaultdict(dict)
+    for rec in records:
+        traj, step = split_video_id(str(rec.get("video_id", "")))
+        if step not in episodes[traj]:
+            episodes[traj][step] = action_codes_from_answer(str(rec.get("a", "")))
+    return episodes
+
+
+def episodes_to_step_gru(episodes):
+    """``episodes[traj][step]=codes`` -> ``step_gru[traj][step]=gru`` (exclusive).
+
+    Walks each trajectory's steps in ascending order with a running prefix,
+    snapshotting ``gru = running + [0]`` *before* extending with the step's own
+    codes (so a step's action never leaks into its own gru). Robust to step gaps
+    (accumulates over present steps only).
+    """
+    step_gru: Dict[str, Dict[int, List[int]]] = {}
+    for traj, step_codes in episodes.items():
+        running: List[int] = []
+        per_step: Dict[int, List[int]] = {}
+        for step in sorted(step_codes):
+            per_step[step] = list(running) + [STOP]
+            running.extend(step_codes[step])
+        step_gru[traj] = per_step
+    return step_gru
+
+
 def build_trajectory_gru(records: List[dict]) -> Dict[str, List[int]]:
     """Reconstruct episodes and return ``{video_id: gru}`` for every row.
 
@@ -93,24 +133,8 @@ def build_trajectory_gru(records: List[dict]) -> Dict[str, List[int]]:
     Robust to step gaps (accumulates over the present sorted steps only) and to
     duplicate steps (all rows at a step receive the identical gru).
     """
-    # traj -> {step: own_codes}
-    episodes: Dict[str, Dict[int, List[int]]] = defaultdict(dict)
-    for rec in records:
-        traj, step = split_video_id(str(rec.get("video_id", "")))
-        # unique step: identical duplicates are harmless; if codes ever differ
-        # keep the first seen (deterministic w.r.t. input order).
-        if step not in episodes[traj]:
-            episodes[traj][step] = action_codes_from_answer(str(rec.get("a", "")))
-
-    # traj -> {step: gru}
-    step_gru: Dict[str, Dict[int, List[int]]] = {}
-    for traj, step_codes in episodes.items():
-        running: List[int] = []
-        per_step: Dict[int, List[int]] = {}
-        for step in sorted(step_codes):
-            per_step[step] = list(running) + [STOP]
-            running.extend(step_codes[step])
-        step_gru[traj] = per_step
+    episodes = accumulate_episodes(records)
+    step_gru = episodes_to_step_gru(episodes)
 
     # assign back to every row (including duplicates) by video_id
     out: Dict[str, List[int]] = {}

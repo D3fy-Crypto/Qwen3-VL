@@ -16,10 +16,14 @@ gru(step S) = concat( action_codes(a) for every prior step k < S ) + [0]
 
 - `action_codes(a)` parses the answer text: `turn right 45 degree → [3,3,3]`,
   `move forward 75 cm → [1,1,1]`, `stop → []` (see `nav_action_encoding.py`).
-- The trailing **`0` is a structural placeholder for the *current* frame** (the action
-  still to be predicted), **not** a STOP the agent emitted. It is on every row, which
-  is what makes `len(gru) == len(frames)`. A real STOP answer parses to `[]`, so genuine
-  stops never add an interior `0` — the only `0` is the tail.
+- The trailing **`0` is a structural placeholder for the *current* node** (the action
+  still to be predicted), **not** a STOP the agent emitted. It is on every row. A real
+  STOP answer parses to `[]`, so genuine stops never add an interior `0` — the only `0`
+  is the tail.
+- **`gru` length is unrelated to `len(frames)`.** `gru` is the history of actions so far
+  (each turn/forward expands to several codes); `frames` is however many frames a slice
+  stores. They are independent and must not be compared. They coincide for the simulator
+  datasets R2R/RxR (one frame per motion primitive) but **not** for real-video Human.
 - The scheme is **exclusive**: a step's own action never appears in its own `gru` (no
   label leakage); it first shows up in the next step's prefix.
 

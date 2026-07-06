@@ -16,7 +16,7 @@
 # Two ways to run:
 #   * Cluster:  sbatch scripts/slurm_gru_qwen_chang.sh
 #       Uses the #SBATCH block above + the SLURM setup below (modules, conda, cd,
-#       master addr, 4 GPUs). ADJUST for your cluster: the #SBATCH account /
+#       4 GPUs). ADJUST for your cluster: the #SBATCH account /
 #       partition / log paths, and REPO_DIR / conda env / BASE_GRU_DIR below.
 #   * Local:    bash scripts/slurm_gru_qwen_chang.sh   (the SLURM block is skipped).
 #
@@ -51,9 +51,7 @@ if [[ -n "${SLURM_JOB_ID:-}" ]]; then
     export WANDB_ENTITY="${WANDB_ENTITY:-project_llm}"
     export WANDB_PROJECT="${WANDB_PROJECT:-qwen3vl-sft-gru}"
 
-    # Distributed coordinates + GPU count from the SLURM allocation.
-    MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" 2>/dev/null | head -n 1)
-    MASTER_PORT=$(shuf -i 20001-29999 -n 1)
+    # Single node -> torchrun handles rendezvous on localhost; just need GPU count.
     NPROC_PER_NODE=${SLURM_GPUS_ON_NODE:-4}
 
     BASE_GRU_DIR=${BASE_GRU_DIR:-/home/djonna1/scratchtinoosh/iros_dataset/base_qwen_with_gru}
@@ -61,8 +59,6 @@ if [[ -n "${SLURM_JOB_ID:-}" ]]; then
     OUTPUT_DIR=${OUTPUT_DIR:-/scratch/tinoosh/chang/checkpoints/${RUN_NAME}}
 else
     # ---- Local single-process run (vega paths) --------------------------------
-    MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
-    MASTER_PORT=${MASTER_PORT:-$(shuf -i 20001-29999 -n 1)}
     NPROC_PER_NODE=${NPROC_PER_NODE:-1}
 
     BASE_GRU_DIR=${BASE_GRU_DIR:-/home/rithvik/IROS_proj/models_ckpts/trained/gru/base_qwen_with_gru}
@@ -151,6 +147,4 @@ echo "  Max steps    : ${MAX_STEPS:-<full>}"
 echo "========================================"
 
 torchrun --nproc_per_node=${NPROC_PER_NODE} \
-         --master_addr=${MASTER_ADDR} \
-         --master_port=${MASTER_PORT} \
          ${ENTRY_FILE} "${args[@]}"
