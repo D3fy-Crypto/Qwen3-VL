@@ -27,6 +27,18 @@
 #   USE_DEEPSPEED=1 DEEPSPEED=./scripts/zero3_offload.json NPROC_PER_NODE=1 \
 #   MAX_STEPS=2 PER_DEVICE_TRAIN_BATCH_SIZE=1 MODEL_MAX_LENGTH=1024 \
 #   REPORT_TO=none DATASETS=r2r_gru bash scripts/slurm_gru_qwen_chang.sh
+#
+# Interactive real-time debug (salloc, 4x A100) — grab GPUs, e.g.:
+#   salloc --account=tinoosh --partition=a100 --gres=gpu:a100:4 \
+#          --cpus-per-task=40 --mem=256G --time=4:00:00
+# then, INSIDE that allocation shell (SLURM_JOB_ID is set, so the cluster
+# setup below runs and torchrun uses all 4 GPUs), launch it DIRECTLY
+# (not `srun bash ...`, so torchrun spawns the 4 workers itself):
+#   DEBUG=1 bash scripts/slurm_gru_qwen_chang.sh
+# DEBUG=1 = tiny fast smoke on the REAL 4-GPU ZeRO-3 stack (few steps, batch 1,
+# one dataset, wandb off, no checkpoints) so distributed-only bugs still
+# reproduce. Every value stays overridable, e.g.:
+#   DEBUG=1 MAX_STEPS=50 DATASETS=r2r_gru,scanqa bash scripts/slurm_gru_qwen_chang.sh
 
 # --- Environment + path defaults: cluster (sbatch) vs local (bash) -----------
 # Each variable gets exactly ONE default, chosen by mode. Export any of them
@@ -69,6 +81,23 @@ fi
 USE_DEEPSPEED=${USE_DEEPSPEED:-1}
 DEEPSPEED=${DEEPSPEED:-./scripts/zero3.json}
 
+# --- DEBUG smoke mode (real-time interactive debugging) ----------------------
+# DEBUG=1 -> tiny, fast crash-and-fix loop on the SAME 4-GPU ZeRO-3 setup so
+# distributed-only bugs still reproduce. Set BEFORE the defaults below so these
+# values win, yet each one stays overridable via its own env var.
+if [[ "${DEBUG:-0}" == "1" ]]; then
+    MAX_STEPS=${MAX_STEPS:-20}
+    PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-1}
+    GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-1}
+    DATASETS=${DATASETS:-r2r_gru}
+    MODEL_MAX_LENGTH=${MODEL_MAX_LENGTH:-1024}
+    LOGGING_STEPS=${LOGGING_STEPS:-1}
+    SAVE_STRATEGY=${SAVE_STRATEGY:-no}
+    DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-0}
+    REPORT_TO=${REPORT_TO:-none}
+    WANDB_MODE=${WANDB_MODE:-offline}
+fi
+
 # Training hyperparameters — all values mirror slurm_sft.sh.
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
 PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-4}
@@ -79,6 +108,8 @@ SAVE_STEPS=${SAVE_STEPS:-500}
 INFERENCE_SNAPSHOT_STEPS=${INFERENCE_SNAPSHOT_STEPS:-10000}
 LOGGING_STEPS=${LOGGING_STEPS:-10}
 MODEL_MAX_LENGTH=${MODEL_MAX_LENGTH:-4096}
+SAVE_STRATEGY=${SAVE_STRATEGY:-steps}
+DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-8}
 REPORT_TO=${REPORT_TO:-wandb}
 WANDB_MODE=${WANDB_MODE:-online}
 # Full mix mirrors slurm_sft.sh, with the nav datasets swapped to their GRU variants:
@@ -111,7 +142,7 @@ args=(
     --max_pixels 50176
     --min_pixels 784
     --eval_strategy no
-    --save_strategy steps
+    --save_strategy "${SAVE_STRATEGY}"
     --save_steps "${SAVE_STEPS}"
     --save_total_limit 2
     --inference_snapshot_steps "${INFERENCE_SNAPSHOT_STEPS}"
@@ -123,7 +154,7 @@ args=(
     --logging_steps "${LOGGING_STEPS}"
     --model_max_length "${MODEL_MAX_LENGTH}"
     --gradient_checkpointing True
-    --dataloader_num_workers 8
+    --dataloader_num_workers "${DATALOADER_NUM_WORKERS}"
     --run_name "${RUN_NAME}"
     --report_to "${REPORT_TO}"
 )
@@ -144,6 +175,7 @@ echo "  Output       : ${OUTPUT_DIR}"
 echo "  DeepSpeed    : ${USE_DEEPSPEED} (${DEEPSPEED})"
 echo "  GPUs/node    : ${NPROC_PER_NODE}"
 echo "  Max steps    : ${MAX_STEPS:-<full>}"
+echo "  Debug mode   : ${DEBUG:-0} (save=${SAVE_STRATEGY}, workers=${DATALOADER_NUM_WORKERS}, report=${REPORT_TO})"
 echo "========================================"
 
 torchrun --nproc_per_node=${NPROC_PER_NODE} \

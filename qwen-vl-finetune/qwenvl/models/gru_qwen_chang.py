@@ -187,30 +187,45 @@ class Qwen3VLGRUForConditionalGeneration(Qwen3VLPreTrainedModel):
         trajectory vector (matches the alignment textonly scheme). Equal length
         keeps mrope position_ids valid; non-nav rows (has_gru=0) are untouched.
 
-        gru_features: (B, T, 7). The collator stacks one trajectory slot per sample
-        as (B, 1, T, 7), which we collapse here.
-        Chang's note: No matter how many <gru> tokens are in the input, we only ever inject one same vector from projector, even it's able to replace multiple <gru> tokens.
+        gru_features: (S, T, 7) — one trajectory per sample. The collator stacks a
+        singleton slot as (S, 1, T, 7), which we collapse here.
+
+        Works for BOTH collators: padded (input_ids [B, L], one nav row = one <gru>)
+        and flattened/packed (input_ids [1, total_len], all samples concatenated so
+        the k-th <gru> in the stream belongs to the k-th nav sample). Each nav
+        sample's <gru> gets ITS OWN projected trajectory vector.
         """
         if gru_features.dim() == 4:
-            gru_features = gru_features[:, 0]                              # (B, T, 7)
+            gru_features = gru_features[:, 0]                              # (S, T, 7)
             gru_lengths = gru_lengths[:, 0] if gru_lengths.dim() == 2 else gru_lengths
 
         # frozen GRU -> last valid state -> trainable projector -> one vec / sample
-        last = self._encode_gru_last_state(gru_features, gru_lengths)     # (B, 256)
-        projected = self.projector(last).to(inputs_embeds.dtype)         # (B, H)
+        last = self._encode_gru_last_state(gru_features, gru_lengths)     # (S, 256)
+        projected = self.projector(last).to(inputs_embeds.dtype)         # (S, H)
 
-        # Overwrite the <gru> token, but only in nav rows (has_gru=1).
-        mask = input_ids == gru_token_id                                 # (B, L)
+        # <gru> positions in the (possibly packed) token stream.
+        mask = input_ids == gru_token_id                                 # (rows, L)
+        n_ph = int(mask.sum())
+        if n_ph == 0:
+            return inputs_embeds                                         # all-QA batch
+
+        # Replacement vectors = the nav samples' projected vectors, in sample order.
+        # Non-nav samples emit no <gru>, so placeholders occur once per nav sample in
+        # order -> they line up row-major with projected[has_gru]. Selecting by has_gru
+        # (instead of masking input rows) is what makes packed [1, L] batches work too.
         if has_gru is not None:
-            mask = mask & has_gru.bool().to(mask.device).view(-1, 1)
-        if not bool(mask.any()):
-            return inputs_embeds                                         # e.g. all-QA batch
+            src = projected[has_gru.bool().to(projected.device)]         # (n_nav, H)
+        else:
+            src = projected
+        if src.shape[0] != n_ph:
+            raise ValueError(
+                f"<gru> placeholder count ({n_ph}) != nav-sample count ({src.shape[0]}); "
+                "each nav sample must carry exactly one <gru>."
+            )
 
-        # Clone (so we don't modify the embedding graph in place), then write each
-        # <gru> row with its own sample's projected vector.
+        # Clone (avoid in-place on the embedding graph), then write each <gru> row.
         out = inputs_embeds.clone()
-        rows = mask.nonzero(as_tuple=False)[:, 0]                        # sample idx per <gru>
-        out[mask] = projected[rows]
+        out[mask] = src
         return out
 
     def forward(
