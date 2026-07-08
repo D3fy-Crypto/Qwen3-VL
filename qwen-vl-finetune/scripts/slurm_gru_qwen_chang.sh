@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=qwen3vl_sft_gru_chang
 #SBATCH --partition=a100
-#SBATCH --gres=gpu:a100:4
+#SBATCH --gres=gpu:a100:8
 #SBATCH --cpus-per-task=40
-#SBATCH --mem=256G
+#SBATCH --mem=768G
 #SBATCH --time=3-00:00:00
 #SBATCH --account=tinoosh
 #SBATCH --output=/scratch/tinoosh/chang/logs/%j_%x.out
@@ -97,7 +97,7 @@ fi
 # Training hyperparameters — all values mirror slurm_sft.sh.
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
 PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-4}
-GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-10}
+GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-5}
 NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS:-1}
 MAX_STEPS=${MAX_STEPS:-}
 SAVE_STEPS=${SAVE_STEPS:-500}

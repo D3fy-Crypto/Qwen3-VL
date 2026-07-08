@@ -17,7 +17,7 @@ def _first_existing_path(candidates):
     return str(Path(candidates[0]))
 
 R2R = {
-    "annotation_path": f"{NAVILA_BASE}/R2R/annotations_oversampled.json",
+    "annotation_path": f"{NAVILA_BASE}/R2R/annotations.json",
     "data_path": f"{NAVILA_BASE}/R2R/train",
 }
 
@@ -36,17 +36,17 @@ ENVDROP = {
 #   * EnvDrop envdrop_motion.json -> {video_id,q,frames,motion} inline per-frame
 #     motion schema, no `a` (has_gru=True; prefixes built from inline `motion`).
 R2R_GRU = {
-    "annotation_path": f"{NAVILA_BASE}/R2R/annotations_oversampled_with_gru.json",
+    "annotation_path": f"{NAVILA_BASE}/R2R/annotations_with_gru.json",
     "data_path": f"{NAVILA_BASE}/R2R/train",
 }
 
 RXR_GRU = {
-    "annotation_path": f"{NAVILA_BASE}/RxR/annotations_oversampled_with_gru.json",
+    "annotation_path": f"{NAVILA_BASE}/RxR/annotations_with_gru.json",
     "data_path": f"{NAVILA_BASE}/RxR/train",
 }
 
 HUMAN_GRU = {
-    "annotation_path": f"{NAVILA_BASE}/Human/annotations_oversampled_with_gru.json",
+    "annotation_path": f"{NAVILA_BASE}/Human/annotations_with_gru.json",
     "data_path": f"{NAVILA_BASE}/Human/raw_frames",
 }
 
@@ -56,12 +56,12 @@ ENVDROP_GRU = {
 }
 
 HUMAN = {
-    "annotation_path": f"{NAVILA_BASE}/Human/annotations_oversampled.json",
+    "annotation_path": f"{NAVILA_BASE}/Human/annotations.json",
     "data_path": f"{NAVILA_BASE}/Human/raw_frames",
 }
 
 RXR = {
-    "annotation_path": f"{NAVILA_BASE}/RxR/annotations_oversampled.json",
+    "annotation_path": f"{NAVILA_BASE}/RxR/annotations.json",
     "data_path": f"{NAVILA_BASE}/RxR/train",
 }
 
